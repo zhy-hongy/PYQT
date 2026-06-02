@@ -1,0 +1,12 @@
+# 忽略构建产物和二进制文件
+build/
+dist/
+*.exe
+*.pkg
+*.pyd
+*.pyc
+__pycache__/
+*.dll
+# 如果你不想提交图片（根据需求选择）
+*.jpg
+*.png

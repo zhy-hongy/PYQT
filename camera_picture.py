@@ -67,7 +67,7 @@ class CameraApp(QMainWindow):
         # 1. 亮度（改为相对调节：-150 到 +150，默认 0 表示不改变原有清晰度）
         slider_layout.addWidget(QLabel("亮度增减:"), 0, 0)
         self.slider_brightness = QSlider(Qt.Horizontal)
-        self.slider_brightness.setRange(0, 9999)  
+        self.slider_brightness.setRange(0, 100)  
         self.slider_brightness.setValue(0) # 默认为0
         self.slider_brightness.valueChanged.connect(self.change_brightness)
         slider_layout.addWidget(self.slider_brightness, 0, 1)
