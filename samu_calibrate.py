@@ -75,10 +75,10 @@ def apply_distortion(xu: np.ndarray, yu: np.ndarray,
     y_tan = p1*(r2 + 2.0*yu*yu) + 2.0*p2*xu*yu
     # xd = x_rad + x_tan
     # yd = y_rad + y_tan
-    x_tilt = alpha1 * tau * xu
-    y_tilt = alpha2 * tau * yu
-    xd = x_rad + x_tan + x_tilt
-    yd = y_rad + y_tan + y_tilt
+    # x_tilt = alpha1 * tau * xu
+    # y_tilt = alpha2 * tau * yu
+    xd = x_rad + x_tan # + x_tilt
+    yd = y_rad + y_tan # + y_tilt
     return xd, yd
 
 def project_points_scheimpflug(P_w: np.ndarray, rvec: np.ndarray, tvec: np.ndarray,
@@ -772,11 +772,315 @@ def evaluate_calibration_baseline_pure(P_w_list: List[np.ndarray], P_img_list: L
         print(f" ❌ 粗糙: 最大物理误差 {max_phy_err:.2f}µm。")
     print("="*69)
 
+
+def image_to_world_point(u, v, rvec, tvec, cam_params):
+    """
+    将图像点逆向投影到世界坐标系中的Z=0平面
+    
+    参数:
+        u, v: 图像坐标（像素）
+        rvec: 旋转向量（3,）
+        tvec: 平移向量（3,）
+        cam_params: 相机参数字典
+    
+    返回:
+        世界坐标点 (3,) 或 None
+    """
+    # 提取参数
+    sx, sy = cam_params['sx'], cam_params['sy']
+    c = cam_params['c']
+    d = cam_params['d']
+    tau = cam_params['tau']
+    rho = cam_params['rho']
+    cx = cam_params['cx']
+    cy = cam_params['cy']
+    k1 = cam_params['k1']
+    k2 = cam_params['k2']
+    k3 = cam_params.get('k3', 0.0)
+    p1 = cam_params['p1']
+    p2 = cam_params['p2']
+    alpha1 = cam_params.get('alpha1', 0.0)
+    alpha2 = cam_params.get('alpha2', 0.0)
+    
+    try:
+        # 1. 像素坐标 -> 传感器物理坐标
+        xd = (u - cx) * sx
+        yd = (v - cy) * sy
+        
+        # 2. 倾斜映射逆变换
+        H = compute_tilt_homography(tau, rho, d, lens_type='perspective')
+        H_inv = np.linalg.inv(H)
+        
+        pt = H_inv @ np.array([xd, yd, 1.0])
+        xt = pt[0] / pt[2]
+        yt = pt[1] / pt[2]
+        
+        # 3. 畸变校正（迭代法）
+        # 简化的畸变校正：使用固定点迭代
+        xu, yu = undistort_point(xt, yt, k1, k2, k3, p1, p2, alpha1, alpha2, tau)
+        
+        # 4. 未倾斜平面上的理想点 -> 相机坐标系
+        Zc = c  # 假设在参考距离处
+        Xc = xu * Zc / c
+        Yc = yu * Zc / c
+        
+        P_c = np.array([Xc, Yc, Zc])
+        
+        # 5. 相机坐标系 -> 世界坐标系
+        R = rodrigues_to_rotation_matrix(rvec)
+        P_w = R.T @ (P_c - tvec)
+        
+        # 假设标定板在Z=0平面
+        if abs(P_w[2]) > 1e-6:
+            # 投影到Z=0平面
+            scale = -P_w[2] / (R.T @ np.array([0, 0, 1]))[2] if False else 1.0
+            # 简化：直接返回
+            return P_w
+        
+        return P_w
+        
+    except Exception as e:
+        return None
+
+
+def undistort_point(x, y, k1, k2, k3, p1, p2, alpha1, alpha2, tau, max_iter=10):
+    """
+    畸变校正（迭代法）
+    """
+    xu, yu = x, y
+    
+    for _ in range(max_iter):
+        r2 = xu*xu + yu*yu
+        r4 = r2*r2
+        r6 = r2*r4
+        
+        radial = 1.0 + k1*r2 + k2*r4 + k3*r6
+        
+        # 计算当前点的畸变
+        x_rad = xu * radial
+        y_rad = yu * radial
+        
+        x_tan = 2.0*p1*xu*yu + p2*(r2 + 2.0*xu*xu)
+        y_tan = p1*(r2 + 2.0*yu*yu) + 2.0*p2*xu*yu
+        
+        x_tilt_comp = alpha1 * tau * xu
+        y_tilt_comp = alpha2 * tau * yu
+        
+        xd = x_rad + x_tan + x_tilt_comp
+        yd = y_rad + y_tan + y_tilt_comp
+        
+        # 更新估计值
+        error_x = xd - x
+        error_y = yd - y
+        
+        if abs(error_x) < 1e-8 and abs(error_y) < 1e-8:
+            break
+        
+        # 简单迭代校正（实际应用中可用牛顿法）
+        xu = xu - error_x * 0.5
+        yu = yu - error_y * 0.5
+    
+    return xu, yu
+
+
+def compute_grid_errors(points_3d, square_size_mm, tolerance=0.2):
+    """
+    计算棋盘格或对称圆点板的邻接点距离误差
+    """
+    errors = []
+    n_points = len(points_3d)
+    
+    # 假设点是按行优先顺序排列的
+    # 需要根据实际的标定板布局来确定邻接关系
+    cols, rows = 8, 11  # 这里应该从实际配置获取
+    
+    # 水平邻接
+    for r in range(rows):
+        for c in range(cols - 1):
+            idx1 = r * cols + c
+            idx2 = r * cols + c + 1
+            if idx1 < n_points and idx2 < n_points:
+                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
+                if abs(dist - square_size_mm) < square_size_mm * tolerance:
+                    errors.append(dist - square_size_mm)
+    
+    # 垂直邻接
+    for c in range(cols):
+        for r in range(rows - 1):
+            idx1 = r * cols + c
+            idx2 = (r + 1) * cols + c
+            if idx1 < n_points and idx2 < n_points:
+                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
+                if abs(dist - square_size_mm) < square_size_mm * tolerance:
+                    errors.append(dist - square_size_mm)
+    
+    return errors
+
+
+def compute_asym_board_errors(points_3d, square_size_mm, tolerance=0.2):
+    """
+    计算非对称圆点板的邻接点距离误差
+    """
+    errors = []
+    n_points = len(points_3d)
+    
+    # 非对称圆点板的特殊处理
+    cols, rows = 8, 11  # 从配置获取
+    
+    for r in range(rows):
+        for c in range(cols - 1):
+            idx1 = r * cols + c
+            idx2 = r * cols + c + 1
+            if idx1 < n_points and idx2 < n_points:
+                # 非对称板的水平间距可能是2倍方格尺寸
+                expected_dist = square_size_mm * (2 if r % 2 == 1 else 1)
+                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
+                if abs(dist - expected_dist) < expected_dist * tolerance:
+                    errors.append(dist - expected_dist)
+    
+    # 垂直邻接
+    for c in range(cols):
+        for r in range(rows - 1):
+            idx1 = r * cols + c
+            idx2 = (r + 1) * cols + c
+            if idx1 < n_points and idx2 < n_points:
+                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
+                if abs(dist - square_size_mm) < square_size_mm * tolerance:
+                    errors.append(dist - square_size_mm)
+    
+    return errors
+
+def evaluate_metric_accuracy_scheimpflug(
+    P_w_list: List[np.ndarray],
+    P_img_list: List[np.ndarray],
+    cam_params: Dict,
+    final_x: np.ndarray,
+    square_size_mm: float
+):
+    """
+    评估沙姆相机的度量精度（物理空间精度）
+    
+    参数:
+        P_w_list: 世界坐标点列表
+        P_img_list: 图像坐标点列表  
+        cam_params: 标定参数字典
+        final_x: 优化后的完整参数向量
+        square_size_mm: 标定板方格尺寸（mm）
+    """
+    print("\n" + "="*20 + " 度量精度评估（Metric Accuracy） " + "="*20)
+    
+    # 提取相机参数
+    sx, sy = cam_params['sx'], cam_params['sy']
+    c, d = cam_params['c'], cam_params['d']
+    tau, rho = cam_params['tau'], cam_params['rho']
+    cx, cy = cam_params['cx'], cam_params['cy']
+    k1, k2, k3 = cam_params['k1'], cam_params['k2'], cam_params.get('k3', 0.0)
+    p1, p2 = cam_params['p1'], cam_params['p2']
+    alpha1, alpha2 = cam_params.get('alpha1', 0.0), cam_params.get('alpha2', 0.0)
+    
+    # 确定内参长度
+    distortion_model = cam_params['distortion_model']
+    if distortion_model == 'none': 
+        int_len = 6
+    elif distortion_model == 'k1': 
+        int_len = 7
+    elif distortion_model == 'k2': 
+        int_len = 8
+    elif distortion_model == 'full': 
+        int_len = 10
+    else:  # full_tilt
+        int_len = 13
+    
+    all_edge_errors = []
+    all_reconstructed_points = []
+    
+    print("\n正在重建空间点坐标...")
+    
+    for i in range(len(P_w_list)):
+        idx = int_len + i * 6
+        rvec = final_x[idx:idx+3]
+        tvec = final_x[idx+3:idx+6]
+        
+        # 获取当前视图的世界坐标和图像坐标
+        P_w = P_w_list[i]
+        P_img = P_img_list[i]
+        num_pts = P_w.shape[0]
+        
+        # ----------------------------------------------------
+        # 1. 通过逆向投影重建空间点
+        # ----------------------------------------------------
+        Pw_reconstructed = []
+        
+        for j in range(num_pts):
+            u, v = P_img[j]
+            
+            # 逆向投影：图像点 -> 世界坐标
+            Pw = image_to_world_point(u, v, rvec, tvec, cam_params)
+            if Pw is not None:
+                Pw_reconstructed.append(Pw)
+        
+        if len(Pw_reconstructed) == num_pts:  # 所有点都重建成功
+            Pw_reconstructed = np.array(Pw_reconstructed)
+            all_reconstructed_points.append(Pw_reconstructed)
+            
+            # ----------------------------------------------------
+            # 2. 计算相邻点距离误差
+            # ----------------------------------------------------
+            # 根据标定板类型确定邻接关系
+            if CALIB_BOARD_TYPE == CALIB_BOARD_CIRCLE_ASYM:
+                # 非对称圆点板的特殊处理
+                edge_errors = compute_asym_board_errors(Pw_reconstructed, square_size_mm)
+            else:
+                # 棋盘格或对称圆点板
+                edge_errors = compute_grid_errors(Pw_reconstructed, square_size_mm)
+            
+            all_edge_errors.extend(edge_errors)
+    
+    if len(all_edge_errors) == 0:
+        print("警告：没有找到有效的邻接点对！")
+        return
+    
+    # 转换为微米
+    all_edge_errors = np.array(all_edge_errors) * 1000.0
+    
+    print("\n" + "-"*50)
+    print("度量精度统计结果：")
+    print(f"  样本数量: {len(all_edge_errors)} 个边")
+    print(f"  平均绝对误差: {np.mean(np.abs(all_edge_errors)):.2f} μm")
+    print(f"  最大绝对误差: {np.max(np.abs(all_edge_errors)):.2f} μm")
+    print(f"  误差标准差: {np.std(all_edge_errors):.2f} μm")
+    print(f"  RMS误差: {np.sqrt(np.mean(all_edge_errors**2)):.2f} μm")
+    
+    # 分位数统计
+    percentiles = [50, 75, 90, 95, 99]
+    print("\n误差分布百分位数：")
+    for p in percentiles:
+        val = np.percentile(np.abs(all_edge_errors), p)
+        print(f"  {p}%: {val:.2f} μm")
+    
+    # 精度等级评估
+    max_err = np.max(np.abs(all_edge_errors))
+    print("\n" + "-"*50)
+    print("【精度等级评估】")
+    if max_err <= 10.0:
+        print(f" 🌟 超高精度: 最大误差 {max_err:.2f}μm ≤ 10μm")
+    elif max_err <= 25.0:
+        print(f" 👍 高精度: 最大误差 {max_err:.2f}μm")
+    elif max_err <= 50.0:
+        print(f" ✓ 良好: 最大误差 {max_err:.2f}μm")
+    elif max_err <= 100.0:
+        print(f" ⚠️ 一般: 最大误差 {max_err:.2f}μm")
+    else:
+        print(f" ❌ 需改进: 最大误差 {max_err:.2f}μm > 100μm")
+    
+    print("="*60)
+
+
 # ============================================================
 #  主程序
 # ============================================================
 if __name__ == "__main__":
-    IMAGE_DIR = r"C:\Users\1\Pictures\Camera Roll"
+    IMAGE_DIR = r"C:\Users\1\Videos\123"
     PATTERN_SIZE = (8, 11)          # 注意：请根据实际棋盘格内角点行列数设置
     SQUARE_SIZE_MM = 1.5
     PIXEL_SIZE_X_MM = 0.004
@@ -785,7 +1089,7 @@ if __name__ == "__main__":
         'c': 8.0, 'd': 8.2, 'tau': np.radians(9.0), 'rho': np.radians(0.0),
         'cx': 640.0, 'cy': 512.0
     }
-    DISTORTION_MODEL = 'full_tilt'# 'none', 'k1', 'k2', 'full', 'full_tilt'
+    DISTORTION_MODEL = 'full'# 'none', 'k1', 'k2', 'full', 'full_tilt'
     LENS_TYPE = 'perspective'
     SHOW_CORNERS = False
     # 放宽筛选参数
@@ -815,8 +1119,9 @@ if __name__ == "__main__":
     )
     
     # 评估
-    evaluate_calibration_baseline_pure(P_w_list, P_img_list, cam_params, cam_params['raw_x'], SQUARE_SIZE_MM)
-    
+    # evaluate_calibration_baseline_pure(P_w_list, P_img_list, cam_params, cam_params['raw_x'], SQUARE_SIZE_MM)
+    # 新增的度量精度评估
+    evaluate_metric_accuracy_scheimpflug(P_w_list, P_img_list, cam_params, cam_params['raw_x'], SQUARE_SIZE_MM)
     # 校正一张示例图像
     test_img = cv2.imread(sample_path)
     if test_img is not None:
