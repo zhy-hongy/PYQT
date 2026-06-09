@@ -260,7 +260,7 @@ class CameraApp(QMainWindow):
             return
 
         filename = time.strftime(
-            "IMG_%Y%m%d_%H%M%S.jpg"
+            "IMG_%Y%m%d_%H%M%S.png"
         )
 
         full_path = os.path.join(

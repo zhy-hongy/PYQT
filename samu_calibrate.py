@@ -75,10 +75,10 @@ def apply_distortion(xu: np.ndarray, yu: np.ndarray,
     y_tan = p1*(r2 + 2.0*yu*yu) + 2.0*p2*xu*yu
     # xd = x_rad + x_tan
     # yd = y_rad + y_tan
-    # x_tilt = alpha1 * tau * xu
-    # y_tilt = alpha2 * tau * yu
-    xd = x_rad + x_tan # + x_tilt
-    yd = y_rad + y_tan # + y_tilt
+    x_tilt = alpha1 * tau * xu
+    y_tilt = alpha2 * tau * yu
+    xd = x_rad + x_tan + x_tilt
+    yd = y_rad + y_tan + y_tilt
     return xd, yd
 
 def project_points_scheimpflug(P_w: np.ndarray, rvec: np.ndarray, tvec: np.ndarray,
@@ -115,20 +115,37 @@ def project_points_scheimpflug(P_w: np.ndarray, rvec: np.ndarray, tvec: np.ndarr
 # ============================================================
 #  角点几何质量筛选函数（调试版）
 # ============================================================
+
 def filter_chessboard_corners(corners, pattern_size, max_line_error_px=2.0, max_dist_ratio=0.5, debug=False):
+    """
+    棋盘格角点质量筛选：间距一致性 + 行列直线拟合（基于垂直距离）
+    
+    参数:
+        corners: 检测到的角点坐标，形状 (N,2) 或 (N,1,2)
+        pattern_size: 棋盘格内角点尺寸 (cols, rows)
+        max_line_error_px: 点到拟合直线的最大允许垂直距离（像素）
+        max_dist_ratio: 间距标准差/均值的最大比例，超则整图无效
+        debug: 是否打印调试信息
+    返回:
+        valid_mask: 布尔数组，长度为 N，True 表示角点有效
+    """
+    # 将角点转换为标准形状 (N,2)
     corners = np.array(corners)
     if corners.ndim == 3 and corners.shape[1] == 1:
         corners = corners.reshape(-1, 2)
     elif corners.ndim != 2 or corners.shape[1] != 2:
         return np.zeros(len(corners), dtype=bool)
-    
+
     cols, rows = pattern_size
     N = len(corners)
     valid_mask = np.ones(N, dtype=bool)
+
+    # 1. 数量检查
     if N != cols * rows:
         valid_mask[:] = False
         return valid_mask
-    
+
+    # 2. 间距一致性检验（水平与垂直方向）
     h_distances = []
     v_distances = []
     for r in range(rows):
@@ -139,65 +156,243 @@ def filter_chessboard_corners(corners, pattern_size, max_line_error_px=2.0, max_
     for c in range(cols):
         for r in range(rows - 1):
             idx1 = r * cols + c
-            idx2 = (r+1) * cols + c
+            idx2 = (r + 1) * cols + c
             v_distances.append(np.linalg.norm(corners[idx2] - corners[idx1]))
-    
+
     if len(h_distances) == 0 or len(v_distances) == 0:
         return valid_mask
-    
+
     mean_h = np.mean(h_distances)
     std_h = np.std(h_distances)
     mean_v = np.mean(v_distances)
     std_v = np.std(v_distances)
-    
+
     if debug:
         print(f"水平距离: 均值={mean_h:.2f}, 标准差={std_h:.2f}, CV={std_h/mean_h:.3f}")
         print(f"垂直距离: 均值={mean_v:.2f}, 标准差={std_v:.2f}, CV={std_v/mean_v:.3f}")
-    
+
     if std_h / mean_h > max_dist_ratio or std_v / mean_v > max_dist_ratio:
         if debug:
             print("间距一致性检验失败")
         valid_mask[:] = False
         return valid_mask
-    
-    # 行拟合
+
+    # 3. 辅助函数：拟合直线并返回点到直线的垂直距离
+    def fit_line_and_distances(pts):
+        """
+        pts: (M,2) 点集
+        返回: (M,) 每个点到拟合直线的垂直距离；拟合失败返回 None
+        """
+        if pts.shape[0] < 2:
+            return None
+        x = pts[:, 0]
+        y = pts[:, 1]
+        var_x = np.var(x)
+        var_y = np.var(y)
+
+        # 所有点共线且与坐标轴平行的情况
+        if var_x < 1e-8 and var_y < 1e-8:
+            return np.zeros_like(x)   # 所有点重合（理论上不会发生）
+        if var_x < 1e-8:   # x 几乎不变，拟合垂直线 x = constant
+            x_mean = np.mean(x)
+            distances = np.abs(x - x_mean)
+            return distances
+        if var_y < 1e-8:   # y 几乎不变，拟合水平线 y = constant
+            y_mean = np.mean(y)
+            distances = np.abs(y - y_mean)
+            return distances
+
+        # 一般情况：选择变化大的坐标作为自变量
+        if var_x >= var_y:
+            # 拟合 y = kx + b
+            A = np.vstack([x, np.ones(len(x))]).T
+            try:
+                k, b = np.linalg.lstsq(A, y, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                return None
+            # 点到直线 kx - y + b = 0 的垂直距离
+            norm = np.sqrt(k * k + 1.0)
+            distances = np.abs(k * x - y + b) / norm
+        else:
+            # 拟合 x = k' y + b'
+            A = np.vstack([y, np.ones(len(y))]).T
+            try:
+                k_prime, b_prime = np.linalg.lstsq(A, x, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                return None
+            # 直线方程: x - k'*y - b' = 0
+            norm = np.sqrt(1.0 + k_prime * k_prime)
+            distances = np.abs(x - k_prime * y - b_prime) / norm
+        return distances
+
+    # 4. 行拟合（垂直距离）
     for r in range(rows):
-        row_indices = list(range(r*cols, (r+1)*cols))
+        row_indices = list(range(r * cols, (r + 1) * cols))
         pts = corners[row_indices]
-        x, y = pts[:,0], pts[:,1]
-        A = np.vstack([x, np.ones(len(x))]).T
-        try:
-            k, b = np.linalg.lstsq(A, y, rcond=None)[0]
-            errors = np.abs(y - (k*x + b))
-            for i, err in enumerate(errors):
-                if err > max_line_error_px:
-                    valid_mask[row_indices[i]] = False
-            if debug and np.max(errors) > max_line_error_px:
-                print(f"行 {r} 最大拟合误差 {np.max(errors):.2f} px")
-        except:
+        distances = fit_line_and_distances(pts)
+        if distances is None:
             valid_mask[row_indices] = False
-    
-    # 列拟合
+            if debug:
+                print(f"行 {r} 拟合失败，全部标记为无效")
+            continue
+        invalid = distances > max_line_error_px
+        if np.any(invalid):
+            valid_mask[np.array(row_indices)[invalid]] = False
+            if debug:
+                print(f"行 {r} 最大垂直距离误差 {np.max(distances):.2f} px")
+
+    # 5. 列拟合（垂直距离）
     for c in range(cols):
-        col_indices = [r*cols + c for r in range(rows)]
+        col_indices = [r * cols + c for r in range(rows)]
         pts = corners[col_indices]
-        x, y = pts[:,0], pts[:,1]
-        A = np.vstack([x, np.ones(len(x))]).T
-        try:
-            k, b = np.linalg.lstsq(A, y, rcond=None)[0]
-            errors = np.abs(y - (k*x + b))
-            for i, err in enumerate(errors):
-                if err > max_line_error_px:
-                    valid_mask[col_indices[i]] = False
-            if debug and np.max(errors) > max_line_error_px:
-                print(f"列 {c} 最大拟合误差 {np.max(errors):.2f} px")
-        except:
+        distances = fit_line_and_distances(pts)
+        if distances is None:
             valid_mask[col_indices] = False
-    
+            if debug:
+                print(f"列 {c} 拟合失败，全部标记为无效")
+            continue
+        invalid = distances > max_line_error_px
+        if np.any(invalid):
+            valid_mask[np.array(col_indices)[invalid]] = False
+            if debug:
+                print(f"列 {c} 最大垂直距离误差 {np.max(distances):.2f} px")
+
     return valid_mask
 
+# # ---------------------------------------------------------------------
+# def load_and_detect_calibration_images(
+#     image_dir: str,
+#     pattern_size: Tuple[int, int],
+#     square_size_mm: float,
+#     show_corners: bool = False,
+#     max_line_error_px=2.0,
+#     max_reject_ratio=0.5,
+#     debug=False
+# ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+#     """
+#     加载标定图片并检测角点/圆点
+#     支持棋盘格、对称圆点板、非对称圆点板
+#     """
+#     # -----------------------------------------------------------------
+#     # 搜索图片
+#     # -----------------------------------------------------------------
+#     extensions = ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff')
+#     image_paths = []
+#     for ext in extensions:
+#         image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
+#         image_paths.extend(glob.glob(os.path.join(image_dir, ext.upper())))
+#     image_paths = sorted(set(image_paths))
+#     if not image_paths:
+#         raise FileNotFoundError(f"在路径 {image_dir} 中没有找到图片！")
+    
+#     print(f"找到 {len(image_paths)} 张图片，正在提取角点/圆点...")
 
-# ---------------------------------------------------------------------
+#     cols, rows = pattern_size
+
+#     # -----------------------------------------------------------------
+#     # 生成世界坐标
+#     # -----------------------------------------------------------------
+#     if CALIB_BOARD_TYPE in (CALIB_BOARD_CHESSBOARD, CALIB_BOARD_CIRCLE_SYM):
+#         objp = np.zeros((cols * rows, 3), np.float64)
+#         objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_size_mm
+#     elif CALIB_BOARD_TYPE == CALIB_BOARD_CIRCLE_ASYM:
+#         objp = np.zeros((cols * rows, 3), np.float64)
+#         idx_pt = 0
+#         for r in range(rows):
+#             for c in range(cols):
+#                 objp[idx_pt, 0] = (2 * c + (r % 2)) * square_size_mm
+#                 objp[idx_pt, 1] = r * square_size_mm
+#                 idx_pt += 1
+#     else:
+#         raise ValueError("未知标定板类型")
+
+#     P_w_list = []
+#     P_img_list = []
+#     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+#     # -----------------------------------------------------------------
+#     # 循环处理每张图片
+#     # -----------------------------------------------------------------
+#     for idx, path in enumerate(image_paths):
+#         img = cv2.imread(path)
+#         if img is None:
+#             continue
+#         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+#         # ---------------- 检测标定板 ----------------
+#         ret = False
+#         corners_subpix = None
+
+#         if CALIB_BOARD_TYPE == CALIB_BOARD_CHESSBOARD:
+#             ret, corners = cv2.findChessboardCorners(
+#                 gray,
+#                 pattern_size,
+#                 flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+#             )
+#             if ret:
+#                 corners_subpix = cv2.cornerSubPix(
+#                     gray, corners, (11,11), (-1,-1), criteria
+#                 )
+#                 if corners_subpix is None or len(corners_subpix) == 0:
+#                     continue
+#                 corners_subpix = corners_subpix.reshape(-1,2)
+
+#                 # 几何筛选
+#                 debug_this = debug and idx == 0
+#                 valid_mask = filter_chessboard_corners(
+#                     corners_subpix,
+#                     pattern_size,
+#                     max_line_error_px,
+#                     max_dist_ratio=0.5,
+#                     debug=debug_this
+#                 )
+#                 reject_ratio = 1.0 - np.sum(valid_mask) / len(valid_mask)
+#                 if reject_ratio > max_reject_ratio:
+#                     print(
+#                         f"{os.path.basename(path)}: 角点几何质量不合格 "
+#                         f"(剔除比例 {reject_ratio:.1%})，跳过该图像"
+#                     )
+#                     if debug_this and show_corners:
+#                         img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+#                         for i_pt, m in enumerate(valid_mask):
+#                             pt = tuple(corners_subpix[i_pt].astype(int))
+#                             color = (0,255,0) if m else (0,0,255)
+#                             cv2.circle(img_draw, pt, 3, color, -1)
+#                         cv2.imshow('角点质量 (绿=有效, 红=无效)', img_draw)
+#                         cv2.waitKey(0)
+#                         cv2.destroyAllWindows()
+#                     continue
+
+#         elif CALIB_BOARD_TYPE in (CALIB_BOARD_CIRCLE_SYM, CALIB_BOARD_CIRCLE_ASYM):
+#             flags = cv2.CALIB_CB_SYMMETRIC_GRID if CALIB_BOARD_TYPE == CALIB_BOARD_CIRCLE_SYM else cv2.CALIB_CB_ASYMMETRIC_GRID
+#             ret, corners = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
+#             if ret:
+#                 corners_subpix = corners.reshape(-1,2)
+
+#         else:
+#             raise ValueError("未知标定板类型")
+
+#         # ---------------- 保存有效角点/圆点 ----------------
+#         if ret and corners_subpix is not None:
+#             P_w_list.append(objp.copy())
+#             P_img_list.append(corners_subpix)
+#             print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
+
+#             if show_corners:
+#                 img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+#                 for pt in corners_subpix:
+#                     cv2.circle(img_draw, tuple(pt.astype(int)), 3, (0,255,0), -1)
+#                 cv2.imshow('角点/圆点', img_draw)
+#                 cv2.waitKey(0)
+
+#     cv2.destroyAllWindows()
+
+#     if len(P_w_list) < 3:
+#         raise ValueError(f"有效图片仅 {len(P_w_list)} 张，至少需要 3 张。")
+#     print(f"有效图片数量: {len(P_w_list)}")
+
+#     return P_w_list, P_img_list
+
 def load_and_detect_calibration_images(
     image_dir: str,
     pattern_size: Tuple[int, int],
@@ -207,13 +402,6 @@ def load_and_detect_calibration_images(
     max_reject_ratio=0.5,
     debug=False
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """
-    加载标定图片并检测角点/圆点
-    支持棋盘格、对称圆点板、非对称圆点板
-    """
-    # -----------------------------------------------------------------
-    # 搜索图片
-    # -----------------------------------------------------------------
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff')
     image_paths = []
     for ext in extensions:
@@ -222,14 +410,8 @@ def load_and_detect_calibration_images(
     image_paths = sorted(set(image_paths))
     if not image_paths:
         raise FileNotFoundError(f"在路径 {image_dir} 中没有找到图片！")
-    
     print(f"找到 {len(image_paths)} 张图片，正在提取角点/圆点...")
-
     cols, rows = pattern_size
-
-    # -----------------------------------------------------------------
-    # 生成世界坐标
-    # -----------------------------------------------------------------
     if CALIB_BOARD_TYPE in (CALIB_BOARD_CHESSBOARD, CALIB_BOARD_CIRCLE_SYM):
         objp = np.zeros((cols * rows, 3), np.float64)
         objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_size_mm
@@ -243,93 +425,65 @@ def load_and_detect_calibration_images(
                 idx_pt += 1
     else:
         raise ValueError("未知标定板类型")
-
     P_w_list = []
     P_img_list = []
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-
-    # -----------------------------------------------------------------
-    # 循环处理每张图片
-    # -----------------------------------------------------------------
     for idx, path in enumerate(image_paths):
         img = cv2.imread(path)
         if img is None:
+            print(f"{os.path.basename(path)}: 图片读取失败，跳过")
             continue
+        
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # ---------------- 检测标定板 ----------------
         ret = False
         corners_subpix = None
-
         if CALIB_BOARD_TYPE == CALIB_BOARD_CHESSBOARD:
             ret, corners = cv2.findChessboardCorners(
-                gray,
-                pattern_size,
+                gray, pattern_size,
                 flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
             )
             if ret:
-                corners_subpix = cv2.cornerSubPix(
-                    gray, corners, (11,11), (-1,-1), criteria
-                )
+                corners_subpix = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
                 if corners_subpix is None or len(corners_subpix) == 0:
+                    print(f"{os.path.basename(path)}: 亚像素角点提取失败，跳过")
                     continue
                 corners_subpix = corners_subpix.reshape(-1,2)
-
-                # 几何筛选
                 debug_this = debug and idx == 0
                 valid_mask = filter_chessboard_corners(
-                    corners_subpix,
-                    pattern_size,
-                    max_line_error_px,
-                    max_dist_ratio=0.5,
-                    debug=debug_this
+                    corners_subpix, pattern_size,
+                    max_line_error_px, max_dist_ratio=0.5, debug=debug_this
                 )
                 reject_ratio = 1.0 - np.sum(valid_mask) / len(valid_mask)
                 if reject_ratio > max_reject_ratio:
-                    print(
-                        f"{os.path.basename(path)}: 角点几何质量不合格 "
-                        f"(剔除比例 {reject_ratio:.1%})，跳过该图像"
-                    )
-                    if debug_this and show_corners:
-                        img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                        for i_pt, m in enumerate(valid_mask):
-                            pt = tuple(corners_subpix[i_pt].astype(int))
-                            color = (0,255,0) if m else (0,0,255)
-                            cv2.circle(img_draw, pt, 3, color, -1)
-                        cv2.imshow('角点质量 (绿=有效, 红=无效)', img_draw)
-                        cv2.waitKey(0)
-                        cv2.destroyAllWindows()
+                    print(f"{os.path.basename(path)}: 角点几何质量不合格 (剔除比例 {reject_ratio:.1%})，跳过")
                     continue
-
+            else:
+                print(f"{os.path.basename(path)}: 未检测到棋盘格，跳过")
         elif CALIB_BOARD_TYPE in (CALIB_BOARD_CIRCLE_SYM, CALIB_BOARD_CIRCLE_ASYM):
             flags = cv2.CALIB_CB_SYMMETRIC_GRID if CALIB_BOARD_TYPE == CALIB_BOARD_CIRCLE_SYM else cv2.CALIB_CB_ASYMMETRIC_GRID
             ret, corners = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
             if ret:
                 corners_subpix = corners.reshape(-1,2)
-
+            else:
+                print(f"{os.path.basename(path)}: 未检测到圆点网格，跳过")
         else:
             raise ValueError("未知标定板类型")
-
-        # ---------------- 保存有效角点/圆点 ----------------
         if ret and corners_subpix is not None:
             P_w_list.append(objp.copy())
             P_img_list.append(corners_subpix)
             print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
-
             if show_corners:
                 img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
                 for pt in corners_subpix:
                     cv2.circle(img_draw, tuple(pt.astype(int)), 3, (0,255,0), -1)
                 cv2.imshow('角点/圆点', img_draw)
                 cv2.waitKey(0)
-
     cv2.destroyAllWindows()
-
     if len(P_w_list) < 3:
         raise ValueError(f"有效图片仅 {len(P_w_list)} 张，至少需要 3 张。")
     print(f"有效图片数量: {len(P_w_list)}")
-
     return P_w_list, P_img_list
+
 
 # ============================================================
 #  初始外参估计（solvePnP）
@@ -423,8 +577,8 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
         upper_bounds = [15.0, 9.5, np.radians(30), np.pi, w-1, h-1, 1.0, 1.0]
     elif distortion_model == 'full':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0]
-        lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 0, 0, -1.0, -1.0, -0.5, -0.5]
-        upper_bounds = [15.0, 15.0, np.radians(30), np.pi, w-1, h-1, 1.0, 1.0, 0.5, 0.5]
+        lower_bounds = [5.0, 15.0, np.radians(9.3)-1e-8, -np.pi, 0, 0, -1.0, -1.0, -0.5, -0.5]
+        upper_bounds = [15.0, 25.0, np.radians(9.3)+1e-8, np.pi, w-1, h-1, 1.0, 1.0, 0.5, 0.5]
     else:  # 'full_tilt'
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 0, 0,
@@ -600,177 +754,7 @@ def rectify_tilt_image(img: np.ndarray, cam_params: Dict, output_size: Optional[
                     rectified[v_out, u_out] = np.clip(val, 0, 255)
     return rectified
 
-# def rectify_tilt_image(img: np.ndarray, cam_params: Dict, output_size: Optional[Tuple[int,int]] = None) -> np.ndarray:
-#     """
-#     只校正镜头畸变，但保留沙姆倾斜透视（不做逆向透视倾斜变换）。
-    
-#     参数:
-#         img: 原始倾斜图像 (H, W) 或 (H, W, 3)
-#         cam_params: 标定参数字典，需包含以下键：
-#             sx, sy, c, d, tau, rho, cx, cy,
-#             k1, k2, k3, p1, p2, alpha1, alpha2
-#         output_size: 输出图像尺寸 (width, height)，默认与输入图像相同
-    
-#     返回:
-#         校正畸变后的图像（仍保留透视倾斜）
-#     """
-#     h_in, w_in = img.shape[:2]
-#     if output_size is None:
-#         out_w, out_h = w_in, h_in
-#     else:
-#         out_w, out_h = output_size
-    
-#     # 提取相机参数
-#     sx = cam_params['sx']
-#     sy = cam_params['sy']
-#     c = cam_params['c']          # 本函数虽未直接使用c/d，但保留以供可能的扩展
-#     d = cam_params['d']
-#     tau = cam_params['tau']
-#     rho = cam_params['rho']
-#     cx = cam_params['cx']
-#     cy = cam_params['cy']
-#     k1 = cam_params['k1']
-#     k2 = cam_params['k2']
-#     k3 = cam_params.get('k3', 0.0)
-#     p1 = cam_params['p1']
-#     p2 = cam_params['p2']
-#     alpha1 = cam_params.get('alpha1', 0.0)
-#     alpha2 = cam_params.get('alpha2', 0.0)
-    
-#     # 准备输出图像（彩色或灰度）
-#     if img.ndim == 3:
-#         rectified = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-#     else:
-#         rectified = np.zeros((out_h, out_w), dtype=np.uint8)
-    
-#     # ============================================================
-#     # 关键修改：不再计算倾斜单应矩阵 H_tilt 及其逆矩阵
-#     # 因此 x_tilt, y_tilt 直接等于理想平面上的物理坐标
-#     # ============================================================
-    
-#     # 遍历输出图像的每个像素（逆向映射）
-#     for v_out in range(out_h):
-#         for u_out in range(out_w):
-#             # 1. 从输出像素坐标转换到理想未倾斜平面上的物理坐标（单位：mm）
-#             x_ideal = (u_out - cx) * sx
-#             y_ideal = (v_out - cy) * sy
-            
-#             # 2. 跳过逆向透视倾斜变换，直接将理想坐标作为倾斜传感器平面上的无畸变点
-#             x_tilt = x_ideal
-#             y_tilt = y_ideal
-            
-#             # 3. 施加正向畸变模型（径向 + 切向 + 倾斜畸变补偿）
-#             r2 = x_tilt * x_tilt + y_tilt * y_tilt
-#             r4 = r2 * r2
-#             r6 = r2 * r4
-#             radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
-#             x_rad = x_tilt * radial
-#             y_rad = y_tilt * radial
-            
-#             x_tan = 2.0 * p1 * x_tilt * y_tilt + p2 * (r2 + 2.0 * x_tilt * x_tilt)
-#             y_tan = p1 * (r2 + 2.0 * y_tilt * y_tilt) + 2.0 * p2 * x_tilt * y_tilt
-            
-#             x_tilt_comp = alpha1 * tau * x_tilt
-#             y_tilt_comp = alpha2 * tau * y_tilt
-            
-#             x_d = x_rad + x_tan + x_tilt_comp
-#             y_d = y_rad + y_tan + y_tilt_comp
-            
-#             # 4. 将畸变后的物理坐标映射回原始图像像素坐标
-#             u_orig = x_d / sx + cx
-#             v_orig = y_d / sy + cy
-            
-#             # 5. 双线性插值（边界检查）
-#             if 0 <= u_orig < w_in - 1 and 0 <= v_orig < h_in - 1:
-#                 u0 = int(np.floor(u_orig))
-#                 u1 = u0 + 1
-#                 v0 = int(np.floor(v_orig))
-#                 v1 = v0 + 1
-#                 du = u_orig - u0
-#                 dv = v_orig - v0
-                
-#                 if img.ndim == 3:  # 彩色图像
-#                     for ch in range(3):
-#                         val = (1 - du) * (1 - dv) * img[v0, u0, ch] + \
-#                               du * (1 - dv) * img[v0, u1, ch] + \
-#                               (1 - du) * dv * img[v1, u0, ch] + \
-#                               du * dv * img[v1, u1, ch]
-#                         rectified[v_out, u_out, ch] = np.clip(val, 0, 255)
-#                 else:  # 灰度图像
-#                     val = (1 - du) * (1 - dv) * img[v0, u0] + \
-#                           du * (1 - dv) * img[v0, u1] + \
-#                           (1 - du) * dv * img[v1, u0] + \
-#                           du * dv * img[v1, u1]
-#                     rectified[v_out, u_out] = np.clip(val, 0, 255)
-    
-#     return rectified
 
-# ============================================================
-#  精度评估
-# ============================================================
-def evaluate_calibration_baseline_pure(P_w_list: List[np.ndarray], P_img_list: List[np.ndarray], 
-                                       cam_params: Dict, final_x: np.ndarray, square_size_mm: float):
-    print("\n" + "="*20 + " 物理空间绝对精度评估 " + "="*20)
-    all_reproj_errors = []
-    all_edge_errors = []
-    
-    sx, sy = cam_params['sx'], cam_params['sy']
-    c, d = cam_params['c'], cam_params['d']
-    tau, rho = cam_params['tau'], cam_params['rho']
-    cx, cy = cam_params['cx'], cam_params['cy']
-    k1, k2, k3 = cam_params['k1'], cam_params['k2'], cam_params.get('k3', 0.0)
-    p1, p2 = cam_params['p1'], cam_params['p2']
-    alpha1, alpha2 = cam_params.get('alpha1', 0.0), cam_params.get('alpha2', 0.0)
-    
-    distortion_model = cam_params['distortion_model']
-    if distortion_model == 'none': int_len = 6
-    elif distortion_model == 'k1': int_len = 7
-    elif distortion_model == 'k2': int_len = 8
-    elif distortion_model == 'full': int_len = 10
-    else: int_len = 13
-    
-    for i in range(len(P_w_list)):
-        idx = int_len + i * 6
-        rvec = final_x[idx:idx+3]
-        tvec = final_x[idx+3:idx+6]
-        P_pred = project_points_scheimpflug(P_w_list[i], rvec, tvec, c, d, tau, rho,
-                                            k1, k2, k3, p1, p2, alpha1, alpha2, sx, sy, cx, cy)
-        pix_errors = np.linalg.norm(P_pred - P_img_list[i], axis=1)
-        all_reproj_errors.extend(pix_errors)
-        
-        P_w = P_w_list[i]
-        num_pts = P_w.shape[0]
-        for idx_a in range(num_pts):
-            x_i, y_i, _ = P_w[idx_a]
-            for idx_b in range(num_pts):
-                x_j, y_j, _ = P_w[idx_b]
-                is_horiz = np.isclose(x_j - x_i, square_size_mm) and np.isclose(y_j, y_i)
-                is_vert = np.isclose(y_j - y_i, square_size_mm) and np.isclose(x_j, x_i)
-                if is_horiz or is_vert:
-                    pred_dist = np.linalg.norm(P_pred[idx_a] - P_pred[idx_b]) * sx
-                    all_edge_errors.append(pred_dist - square_size_mm)
-    
-    all_reproj_errors = np.array(all_reproj_errors)
-    all_edge_errors = np.array(all_edge_errors) * 1000.0
-    print(f"1. 像素重投影误差统计:")
-    print(f"   - 平均误差: {np.mean(all_reproj_errors):.4f} 像素")
-    print(f"   - 最大误差: {np.max(all_reproj_errors):.4f} 像素")
-    print(f"\n2. 物理空间格网形变残差统计:")
-    print(f"   - 平均物理偏差: {np.mean(np.abs(all_edge_errors)):.2f} µm")
-    print(f"   - 最大物理偏差: {np.max(np.abs(all_edge_errors)):.2f} µm")
-    print(f"   - 物理偏差标准差: {np.std(all_edge_errors):.2f} µm")
-    max_phy_err = np.max(np.abs(all_edge_errors))
-    print("\n" + "-"*50)
-    print(f"【当前标定精度段位评估】:")
-    if max_phy_err <= 5.0:
-        print(f" 🌟 完美: 最大物理误差 {max_phy_err:.2f}µm <= 5µm。")
-    elif max_phy_err <= 25.0:
-        print(f" 👍 良好: 最大物理误差 {max_phy_err:.2f}µm。")
-    elif max_phy_err <= 100.0:
-        print(f" ⚠️ 一般: 最大物理误差 {max_phy_err:.2f}µm。")
-    else:
-        print(f" ❌ 粗糙: 最大物理误差 {max_phy_err:.2f}µm。")
-    print("="*69)
 
 
 def image_to_world_point(u, v, rvec, tvec, cam_params):
@@ -950,139 +934,272 @@ def compute_asym_board_errors(points_3d, square_size_mm, tolerance=0.2):
     
     return errors
 
-def evaluate_metric_accuracy_scheimpflug(
-    P_w_list: List[np.ndarray],
-    P_img_list: List[np.ndarray],
-    cam_params: Dict,
-    final_x: np.ndarray,
-    square_size_mm: float
+# ============================================================
+#  验证函数：使用独立测试图评估标定质量
+# ============================================================
+
+# def validate_scheimpflug_calibration(
+#     image_path,
+#     cam_params,
+#     pattern_size,
+#     square_size_mm,
+#     show=False
+# ):
+#     import cv2
+#     import numpy as np
+
+#     # 1. 读图 + 角点检测
+#     img = cv2.imread(image_path)
+#     if img is None:
+#         raise ValueError("图像读取失败")
+
+#     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+#     ret, corners = cv2.findChessboardCorners(
+#         gray, pattern_size,
+#         flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+#     )
+#     if not ret:
+#         raise RuntimeError("角点检测失败")
+
+#     corners = cv2.cornerSubPix(
+#         gray, corners, (11, 11), (-1, -1),
+#         criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+#     ).reshape(-1, 2)
+
+#     # 2. 世界坐标
+#     cols, rows = pattern_size
+#     objp = np.zeros((cols * rows, 3), np.float64)
+#     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_size_mm
+
+#     # 3. 利用标定好的内参和畸变，通过 solvePnP 估计外参
+#     #   注意：这里应使用完整的 Scheimpflug 投影模型，但 solvePnP 需要提供初始内参
+#     #   我们先用针孔模型初始化外参（近似），然后将该外参作为初始值，再用 Scheimpflug 投影进行精化（可选）
+#     #   或者直接使用 solvePnP 配合标定出的内参矩阵（虽然模型不是严格针孔，但可作为初值）
+#     fx = cam_params['c'] / cam_params['sx']
+#     fy = cam_params['c'] / cam_params['sy']
+#     K_pinhole = np.array([
+#         [fx, 0, cam_params['cx']],
+#         [0, fy, cam_params['cy']],
+#         [0, 0, 1]
+#     ], dtype=np.float64)
+#     dist_pinhole = np.array([cam_params['k1'], cam_params['k2'], 
+#                               cam_params['p1'], cam_params['p2']], dtype=np.float64)
+    
+#     _, rvec, tvec = cv2.solvePnP(objp, corners, K_pinhole, dist_pinhole,
+#                                  flags=cv2.SOLVEPNP_ITERATIVE)
+    
+#     # 如果希望更精确的外参，可以基于完整 Scheimpflug 模型进行非线性优化（仅优化外参）
+#     # 为简化，这里直接使用 solvePnP 的结果即可，后续投影会使用完整的 Scheimpflug 模型
+
+#     # 4. 使用完整 Scheimpflug 模型投影
+#     proj = project_points_scheimpflug(
+#         objp,
+#         rvec.ravel(),
+#         tvec.ravel(),
+#         cam_params['c'],
+#         cam_params['d'],
+#         cam_params['tau'],
+#         cam_params['rho'],
+#         cam_params['k1'],
+#         cam_params['k2'],
+#         cam_params.get('k3', 0.0),
+#         cam_params['p1'],
+#         cam_params['p2'],
+#         cam_params.get('alpha1', 0.0),
+#         cam_params.get('alpha2', 0.0),
+#         cam_params['sx'],
+#         cam_params['sy'],
+#         cam_params['cx'],
+#         cam_params['cy']
+#     )
+
+#     # 5. 误差计算
+#     errors = np.linalg.norm(proj - corners, axis=1)
+#     mean_err = np.mean(errors)
+#     rms_err = np.sqrt(np.mean(errors ** 2))
+#     max_err = np.max(errors)
+
+#     print("\n====================")
+#     print("验证结果（无优化真实误差）")
+#     print("====================")
+#     print(f"Mean: {mean_err:.4f} px")
+#     print(f"RMS : {rms_err:.4f} px")
+#     print(f"Max : {max_err:.4f} px")
+#     print("OK" if rms_err < 0.5 else "FAIL")
+
+#     # 6. 可视化
+#     if show:
+#         vis = img.copy()
+#         for p1, p2 in zip(corners, proj):
+#             p1 = tuple(p1.astype(int))
+#             p2 = tuple(p2.astype(int))
+#             cv2.circle(vis, p1, 3, (0, 255, 0), -1)   # 绿色为检测点
+#             cv2.circle(vis, p2, 3, (0, 0, 255), -1)   # 红色为投影点
+#             cv2.line(vis, p1, p2, (255, 0, 0), 1)
+#         cv2.imshow("validation", vis)
+#         cv2.waitKey(0)
+#         cv2.destroyAllWindows()
+
+#     return {
+#         "mean": float(mean_err),
+#         "rms": float(rms_err),
+#         "max": float(max_err),
+#         "is_good": bool(rms_err < 0.5),
+#         "rvec": rvec.ravel().tolist(),
+#         "tvec": tvec.ravel().tolist()
+#     }
+
+
+def validate_scheimpflug_calibration(
+    image_path,
+    cam_params,
+    pattern_size,
+    square_size_mm,
+    show=False
 ):
-    """
-    评估沙姆相机的度量精度（物理空间精度）
-    
-    参数:
-        P_w_list: 世界坐标点列表
-        P_img_list: 图像坐标点列表  
-        cam_params: 标定参数字典
-        final_x: 优化后的完整参数向量
-        square_size_mm: 标定板方格尺寸（mm）
-    """
-    print("\n" + "="*20 + " 度量精度评估（Metric Accuracy） " + "="*20)
-    
-    # 提取相机参数
-    sx, sy = cam_params['sx'], cam_params['sy']
-    c, d = cam_params['c'], cam_params['d']
-    tau, rho = cam_params['tau'], cam_params['rho']
-    cx, cy = cam_params['cx'], cam_params['cy']
-    k1, k2, k3 = cam_params['k1'], cam_params['k2'], cam_params.get('k3', 0.0)
-    p1, p2 = cam_params['p1'], cam_params['p2']
-    alpha1, alpha2 = cam_params.get('alpha1', 0.0), cam_params.get('alpha2', 0.0)
-    
-    # 确定内参长度
-    distortion_model = cam_params['distortion_model']
-    if distortion_model == 'none': 
-        int_len = 6
-    elif distortion_model == 'k1': 
-        int_len = 7
-    elif distortion_model == 'k2': 
-        int_len = 8
-    elif distortion_model == 'full': 
-        int_len = 10
-    else:  # full_tilt
-        int_len = 13
-    
-    all_edge_errors = []
-    all_reconstructed_points = []
-    
-    print("\n正在重建空间点坐标...")
-    
-    for i in range(len(P_w_list)):
-        idx = int_len + i * 6
-        rvec = final_x[idx:idx+3]
-        tvec = final_x[idx+3:idx+6]
-        
-        # 获取当前视图的世界坐标和图像坐标
-        P_w = P_w_list[i]
-        P_img = P_img_list[i]
-        num_pts = P_w.shape[0]
-        
-        # ----------------------------------------------------
-        # 1. 通过逆向投影重建空间点
-        # ----------------------------------------------------
-        Pw_reconstructed = []
-        
-        for j in range(num_pts):
-            u, v = P_img[j]
-            
-            # 逆向投影：图像点 -> 世界坐标
-            Pw = image_to_world_point(u, v, rvec, tvec, cam_params)
-            if Pw is not None:
-                Pw_reconstructed.append(Pw)
-        
-        if len(Pw_reconstructed) == num_pts:  # 所有点都重建成功
-            Pw_reconstructed = np.array(Pw_reconstructed)
-            all_reconstructed_points.append(Pw_reconstructed)
-            
-            # ----------------------------------------------------
-            # 2. 计算相邻点距离误差
-            # ----------------------------------------------------
-            # 根据标定板类型确定邻接关系
-            if CALIB_BOARD_TYPE == CALIB_BOARD_CIRCLE_ASYM:
-                # 非对称圆点板的特殊处理
-                edge_errors = compute_asym_board_errors(Pw_reconstructed, square_size_mm)
-            else:
-                # 棋盘格或对称圆点板
-                edge_errors = compute_grid_errors(Pw_reconstructed, square_size_mm)
-            
-            all_edge_errors.extend(edge_errors)
-    
-    if len(all_edge_errors) == 0:
-        print("警告：没有找到有效的邻接点对！")
-        return
-    
-    # 转换为微米
-    all_edge_errors = np.array(all_edge_errors) * 1000.0
-    
-    print("\n" + "-"*50)
-    print("度量精度统计结果：")
-    print(f"  样本数量: {len(all_edge_errors)} 个边")
-    print(f"  平均绝对误差: {np.mean(np.abs(all_edge_errors)):.2f} μm")
-    print(f"  最大绝对误差: {np.max(np.abs(all_edge_errors)):.2f} μm")
-    print(f"  误差标准差: {np.std(all_edge_errors):.2f} μm")
-    print(f"  RMS误差: {np.sqrt(np.mean(all_edge_errors**2)):.2f} μm")
-    
-    # 分位数统计
-    percentiles = [50, 75, 90, 95, 99]
-    print("\n误差分布百分位数：")
-    for p in percentiles:
-        val = np.percentile(np.abs(all_edge_errors), p)
-        print(f"  {p}%: {val:.2f} μm")
-    
-    # 精度等级评估
-    max_err = np.max(np.abs(all_edge_errors))
-    print("\n" + "-"*50)
-    print("【精度等级评估】")
-    if max_err <= 10.0:
-        print(f" 🌟 超高精度: 最大误差 {max_err:.2f}μm ≤ 10μm")
-    elif max_err <= 25.0:
-        print(f" 👍 高精度: 最大误差 {max_err:.2f}μm")
-    elif max_err <= 50.0:
-        print(f" ✓ 良好: 最大误差 {max_err:.2f}μm")
-    elif max_err <= 100.0:
-        print(f" ⚠️ 一般: 最大误差 {max_err:.2f}μm")
-    else:
-        print(f" ❌ 需改进: 最大误差 {max_err:.2f}μm > 100μm")
-    
-    print("="*60)
+    # 1. 读图 + 角点检测
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError("图像读取失败")
 
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+    ret, corners = cv2.findChessboardCorners(
+        gray, pattern_size,
+        flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+    )
+    if not ret:
+        raise RuntimeError("角点检测失败")
+
+    corners = cv2.cornerSubPix(
+        gray, corners, (11, 11), (-1, -1),
+        criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    ).reshape(-1, 2)
+
+    # 2. 世界坐标
+    cols, rows = pattern_size
+    objp = np.zeros((cols * rows, 3), np.float64)
+    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_size_mm
+
+    # 3. 利用标定好的内参和畸变，通过 solvePnP 估计外参初值
+    fx = cam_params['c'] / cam_params['sx']
+    fy = cam_params['c'] / cam_params['sy']
+    K_pinhole = np.array([
+        [fx, 0, cam_params['cx']],
+        [0, fy, cam_params['cy']],
+        [0, 0, 1]
+    ], dtype=np.float64)
+    dist_pinhole = np.array([cam_params['k1'], cam_params['k2'], 
+                             cam_params['p1'], cam_params['p2']], dtype=np.float64)
+    
+    _, rvec_init, tvec_init = cv2.solvePnP(objp, corners, K_pinhole, dist_pinhole,
+                                           flags=cv2.SOLVEPNP_ITERATIVE)
+    
+    # 组合初值 [rvec_x, rvec_y, rvec_z, tvec_x, tvec_y, tvec_z]
+    x0 = np.hstack((rvec_init.ravel(), tvec_init.ravel()))
+
+    # 4. 定义残差函数（仅优化外参）
+    def loss_function(ext_params):
+        rvec_opt = ext_params[0:3]
+        tvec_opt = ext_params[3:6]
+        
+        # 调用完整的 Scheimpflug 模型进行重投影
+        proj_pts = project_points_scheimpflug(
+            objp,
+            rvec_opt,
+            tvec_opt,
+            cam_params['c'],
+            cam_params['d'],
+            cam_params['tau'],
+            cam_params['rho'],
+            cam_params['k1'],
+            cam_params['k2'],
+            cam_params.get('k3', 0.0),
+            cam_params['p1'],
+            cam_params['p2'],
+            cam_params.get('alpha1', 0.0),
+            cam_params.get('alpha2', 0.0),
+            cam_params['sx'],
+            cam_params['sy'],
+            cam_params['cx'],
+            cam_params['cy']
+        )
+        # 返回一维残差数组 (x1-u1, y1-v1, x2-u2, y2-v2, ...)
+        return (proj_pts - corners).ravel()
+
+    # 5. 执行非线性优化精化外参
+    # 使用 Levenberg-Marquardt (lm) 算法，适合无边界约束的最小二乘问题
+    res = least_squares(loss_function, x0, method='lm')
+    
+    # 提取优化后的外参
+    rvec_optimized = res.x[0:3]
+    tvec_optimized = res.x[3:6]
+    print(f"优化前rvec_init: {rvec_init.ravel()}, tvec_init: {tvec_init.ravel()}")
+    print(f"优化后rvec_optimized: {rvec_optimized}, tvec_optimized: {tvec_optimized}")
+    # 6. 使用优化后的外参计算最终投影和误差
+    proj = project_points_scheimpflug(
+        objp,
+        rvec_optimized,
+        tvec_optimized,
+        cam_params['c'],
+        cam_params['d'],
+        cam_params['tau'],
+        cam_params['rho'],
+        cam_params['k1'],
+        cam_params['k2'],
+        cam_params.get('k3', 0.0),
+        cam_params['p1'],
+        cam_params['p2'],
+        cam_params.get('alpha1', 0.0),
+        cam_params.get('alpha2', 0.0),
+        cam_params['sx'],
+        cam_params['sy'],
+        cam_params['cx'],
+        cam_params['cy']
+    )
+
+    errors = np.linalg.norm(proj - corners, axis=1)
+    mean_err = np.mean(errors)
+    rms_err = np.sqrt(np.mean(errors ** 2))
+    max_err = np.max(errors)
+
+    print("\n====================")
+    print("验证结果（外参已基于Scheimpflug模型优化）")
+    print("====================")
+    print(f"Mean: {mean_err:.4f} px")
+    print(f"RMS : {rms_err:.4f} px")
+    print(f"Max : {max_err:.4f} px")
+    print("OK" if rms_err < 0.5 else "FAIL")
+
+    # 7. 可视化
+    if show:
+        vis = img.copy()
+        for p1, p2 in zip(corners, proj):
+            p1 = tuple(p1.astype(int))
+            p2 = tuple(p2.astype(int))
+            cv2.circle(vis, p1, 3, (0, 255, 0), -1)   # 绿色为检测点
+            cv2.circle(vis, p2, 3, (0, 0, 255), -1)   # 红色为投影点
+            cv2.line(vis, p1, p2, (255, 0, 0), 1)
+        cv2.imshow("validation", vis)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    return {
+        "mean": float(mean_err),
+        "rms": float(rms_err),
+        "max": float(max_err),
+        "is_good": bool(rms_err < 0.5),
+        "rvec": rvec_optimized.tolist(),
+        "tvec": tvec_optimized.tolist()
+    }
 # ============================================================
 #  主程序
 # ============================================================
 if __name__ == "__main__":
-    IMAGE_DIR = r"C:\Users\1\Videos\123"
-    PATTERN_SIZE = (8, 11)          # 注意：请根据实际棋盘格内角点行列数设置
-    SQUARE_SIZE_MM = 1.5
+    IMAGE_DIR = r"C:\Users\1\Pictures\Camera Roll"  # 请替换为实际的标定图片目录
+    PATTERN_SIZE = (11, 8)          # 注意：请根据实际棋盘格内角点行列数设置
+    SQUARE_SIZE_MM = 5
     PIXEL_SIZE_X_MM = 0.004
     PIXEL_SIZE_Y_MM = 0.004
     INIT_INTRINSIC = {
@@ -1093,7 +1210,7 @@ if __name__ == "__main__":
     LENS_TYPE = 'perspective'
     SHOW_CORNERS = False
     # 放宽筛选参数
-    MAX_LINE_ERROR_PX = 3.0
+    MAX_LINE_ERROR_PX = 1.0
     MAX_REJECT_RATIO = 0.6
     DEBUG_CORNERS = True
     
@@ -1104,10 +1221,28 @@ if __name__ == "__main__":
         debug=DEBUG_CORNERS
     )
     
-    # 获取图像尺寸
-    sample_path = glob.glob(os.path.join(IMAGE_DIR, "*.[jJ][pP][gG]"))[0]
+    # ===== 自动识别图片类型，获取第一张图片的尺寸 =====
+    extensions = ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff')
+    sample_path = None
+
+    for ext in extensions:
+        # 小写扩展名
+        files = glob.glob(os.path.join(IMAGE_DIR, ext))
+        if files:
+            sample_path = files[0]
+            break
+        # 大写扩展名
+        files = glob.glob(os.path.join(IMAGE_DIR, ext.upper()))
+        if files:
+            sample_path = files[0]
+            break
+
+    if sample_path is None:
+        raise FileNotFoundError(f"在目录 {IMAGE_DIR} 中没有找到任何图片文件（支持格式：jpg/jpeg/png/bmp/tif/tiff）")
+
     sample_img = cv2.imread(sample_path)
     img_h, img_w = sample_img.shape[:2]
+    # print(f"使用图片 {os.path.basename(sample_path)} 获取图像尺寸: {img_w} x {img_h}")
     
     # 标定
     cam_params = calibrate_scheimpflug(
@@ -1118,16 +1253,27 @@ if __name__ == "__main__":
         lens_type=LENS_TYPE
     )
     
-    # 评估
-    # evaluate_calibration_baseline_pure(P_w_list, P_img_list, cam_params, cam_params['raw_x'], SQUARE_SIZE_MM)
-    # 新增的度量精度评估
-    evaluate_metric_accuracy_scheimpflug(P_w_list, P_img_list, cam_params, cam_params['raw_x'], SQUARE_SIZE_MM)
+    # 调用验证函数
+    result = validate_scheimpflug_calibration(
+        "test.jpg",  # 请替换为实际的测试图片路径
+        cam_params,
+        (11, 8),
+        5.0,
+        show=True
+        )
+    # 可选：保存更详细的误差图
+    if result['is_good']:
+        print("✅ 标定通过，可用于实际测量")
+    else:
+        print("❌ 标定不通过，建议增加更多标定图片或调整畸变模型")
     # 校正一张示例图像
     test_img = cv2.imread(sample_path)
     if test_img is not None:
         rectified = rectify_tilt_image(test_img, cam_params)
-        cv2.imwrite("rectified_example.jpg", rectified)
-        print("\n校正后的图像已保存至 rectified_example.jpg")
+        cv2.imshow("rectified", rectified)
+        cv2.waitKey(0)
+    #     cv2.imwrite("rectified_example.jpg", rectified)
+    #     print("\n校正后的图像已保存至 rectified_example.jpg")
     
     print("\n" + "="*60)
     print("高精度标定提醒：...")

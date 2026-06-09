@@ -10,14 +10,14 @@ import os
 import matplotlib.pyplot as plt
 
 # ==================== ★ 宏：切换标定板类型 ★ ====================
-PATTERN_TYPE = "circlegrid"  # "chessboard" 或 "circlegrid"
+PATTERN_TYPE = "chessboard"  # "chessboard" 或 "circlegrid"
 # ====================================================================
 
 CONFIG = {
     "pattern_type": PATTERN_TYPE,
-    "pattern_size": (7, 7),  # (列数, 行数) 
+    "pattern_size": (11, 8),  # (列数, 行数) 
     "square_size": 5.0,       # 实际测量间距 (单位: mm)
-    "images_path": "./saved_images/*.jpg",
+    "images_path": r"C:\Users\1\Pictures\Camera Roll\*.jpg",
     "show_detection": True,   
     "save_result": True,
     "result_path": "calibration_data/calibration_result.npz",

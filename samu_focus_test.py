@@ -15,7 +15,7 @@ f_mm = 8.0
 sx_um = 4.0
 sy_um = 4.0
 cx = 640.0
-cy = 516.0
+cy = 512.0
 theta_deg = 9.3
 theta = np.radians(theta_deg)
 
@@ -75,11 +75,18 @@ def pixel_to_object(u, v):
 # ==========================================
 # 3. 图像尺寸及绘图参数
 # ==========================================
-img_h, img_w = 1032, 1280
-margin = 1
-x1, y1 = margin, margin
-x2, y2 = img_w - margin, img_h - margin
+img_h, img_w = 1024, 1280
+margin = 100
 offset = 150
+
+# 改为正方形（居中放置）
+square_side = min(img_w, img_h) - 2 * margin
+x1 = (img_w - square_side) // 2
+y1 = (img_h - square_side) // 2
+x2 = x1 + square_side
+y2 = y1 + square_side
+
+# 四个圆角位置
 circle_centers = [
     (x1 + offset, y1 + offset),
     (x2 - offset, y1 + offset),
@@ -87,21 +94,18 @@ circle_centers = [
     (x1 + offset, y2 - offset)
 ]
 
-
-
 # ==========================================
-# 4. 生成 CMOS 图像（使用 OpenCV 绘制三个黑色同心圆环）
+# 4. 生成 CMOS 图像
 # ==========================================
-cmos_img = np.full((img_h, img_w, 3), 255, dtype=np.uint8)  # 白色背景
+cmos_img = np.full((img_h, img_w, 3), 255, dtype=np.uint8)
 
-# 绘制矩形边框
+# 绘制正方形边框
 cv2.rectangle(cmos_img, (x1, y1), (x2, y2), (0,0,0), thickness=1)
 
-# 绘制四个位置的三个同心圆环（黑色，线宽 thickness_pixel）
+# 绘制四个位置的三个同心圆环
 for (cu, cv) in circle_centers:
     for r in radii:
         cv2.circle(cmos_img, (cu, cv), r, (0,0,0), thickness=thickness_pixel)
-
 # 绘制中心虚线（水平+垂直）
 mid_u = (x1 + x2) // 2
 mid_v = (y1 + y2) // 2
