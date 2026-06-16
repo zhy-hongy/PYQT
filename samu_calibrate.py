@@ -365,9 +365,9 @@ def load_and_detect_calibration_images(
                     for c in range(cols):
                         idx = r * cols + c
                         center = tuple(pts[idx].astype(int))
-                        cv2.circle(img_draw, center, 5, color, -1)
+                        cv2.circle(img_draw, center, 3, color, -1)
                         row_pts.append(center)
-                    cv2.polylines(img_draw, [np.array(row_pts)], False, color, 2)
+                    cv2.polylines(img_draw, [np.array(row_pts)], False, color, 1)
                 # 每列也用淡色折线连接
                 for c in range(cols):
                     col_pts = []
@@ -375,7 +375,7 @@ def load_and_detect_calibration_images(
                         idx = r * cols + c
                         col_pts.append(tuple(pts[idx].astype(int)))
                     cv2.polylines(img_draw, [np.array(col_pts)], False, (180, 180, 180), 1)
-                cv2.imshow('角点/圆点', img_draw)
+                cv2.imshow('calibrate', img_draw)
                 cv2.waitKey(0)
     cv2.destroyAllWindows()
     if len(P_w_list) < 3:
@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
     }
     DISTORTION_MODEL = 'full_k3'# 'none', 'k1', 'k2', 'full', 'full_k3'
     LENS_TYPE = 'perspective'
-    SHOW_CORNERS = False
+    SHOW_CORNERS = True
     # 放宽筛选参数 
     MAX_LINE_ERROR_PX = 1.0
     MAX_REJECT_RATIO = 0.6
