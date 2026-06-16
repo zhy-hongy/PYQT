@@ -341,9 +341,40 @@ def load_and_detect_calibration_images(
             P_img_list.append(corners_subpix)
             # print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
             if show_corners:
+                cols, rows = pattern_size
                 img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                for pt in corners_subpix:
-                    cv2.circle(img_draw, tuple(pt.astype(int)), 3, (0,255,0), -1)
+                colors = [
+                    (0, 255, 0),     # 绿
+                    (0, 0, 255),     # 红
+                    (255, 0, 0),     # 蓝
+                    (0, 255, 255),   # 黄
+                    (255, 0, 255),   # 品红
+                    (255, 255, 0),   # 青
+                    (0, 128, 255),   # 橙
+                    (128, 0, 255),   # 紫
+                    (255, 128, 0),   # 橙
+                    (128, 255, 0),   # 浅绿
+                    (255, 128, 128), # 粉
+                    (128, 255, 255), # 浅蓝
+                ]
+                pts = corners_subpix  # shape (N, 2)
+                # 每行不同颜色 + 折线连接
+                for r in range(rows):
+                    color = colors[r % len(colors)]
+                    row_pts = []
+                    for c in range(cols):
+                        idx = r * cols + c
+                        center = tuple(pts[idx].astype(int))
+                        cv2.circle(img_draw, center, 5, color, -1)
+                        row_pts.append(center)
+                    cv2.polylines(img_draw, [np.array(row_pts)], False, color, 2)
+                # 每列也用淡色折线连接
+                for c in range(cols):
+                    col_pts = []
+                    for r in range(rows):
+                        idx = r * cols + c
+                        col_pts.append(tuple(pts[idx].astype(int)))
+                    cv2.polylines(img_draw, [np.array(col_pts)], False, (180, 180, 180), 1)
                 cv2.imshow('角点/圆点', img_draw)
                 cv2.waitKey(0)
     cv2.destroyAllWindows()
@@ -355,24 +386,6 @@ def load_and_detect_calibration_images(
 # ============================================================
 #  初始外参估计（solvePnP）
 # ============================================================
-def estimate_initial_extrinsics(P_w_list, P_img_list, c_init, cx_init, cy_init, sx, sy):
-    fx_init = c_init / sx
-    fy_init = c_init / sy
-    K_init = np.array([[fx_init, 0, cx_init], [0, fy_init, cy_init], [0, 0, 1]], dtype=np.float64)
-    dist_init = np.zeros(4)
-    extrinsics = []
-    print("正在使用 solvePnP 估计初始外参...")
-    for i, (P_w, P_img) in enumerate(zip(P_w_list, P_img_list)):
-        success, rvec, tvec = cv2.solvePnP(P_w, P_img, K_init, dist_init,
-                                           flags=cv2.SOLVEPNP_ITERATIVE)
-        if not success:
-            rvec = np.zeros(3)
-            tvec = np.array([0, 0, 100.0])
-        extrinsics.append((rvec.flatten(), tvec.flatten()))
-        # print(f"  视图 {i}: t = [{tvec[0,0]:.2f}, {tvec[1,0]:.2f}, {tvec[2,0]:.2f}] mm")
-    return extrinsics
-
-
 
 def estimate_initial_extrinsics_scheimpflug(P_w_list, P_img_list, cam_params):
     """
@@ -501,8 +514,8 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
         upper_bounds = [15.0, 25.0,  np.radians(30),  np.pi, w-1, 532, 1.0, 1.0, 0.5, 0.5]
     elif distortion_model == 'full_k3':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        lower_bounds = [5.0,   5.0, -np.radians(30), -np.pi, 0,   492, -1.0, -1.0, -1.0, -0.5, -0.5]
-        upper_bounds = [15.0, 50.0,  np.radians(30),  np.pi, w-1, h-1,  1.0,  1.0,  1.0,  0.5,  0.5]
+        lower_bounds = [5.0,   5.0,  np.radians(9.3)-1e-8, -np.pi, 0,   492, -1.0, -1.0, -1.0, -0.5, -0.5]
+        upper_bounds = [15.0, 50.0,  np.radians(9.3)+1e-8,  np.pi, w-1, h-1,  1.0,  1.0,  1.0,  0.5,  0.5]
     else:  # 'full_tilt'
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 0, 0,
@@ -1022,7 +1035,7 @@ if __name__ == "__main__":
     DEBUG_CORNERS = True
     
     # 验证用测试图片路径
-    TEST_IMAGE_PATH = r"C:\Users\1\Pictures\Camera Roll"
+    TEST_IMAGE_PATH = r"./saved_images"
     test_images = glob.glob(f"{TEST_IMAGE_PATH}/*.png") + glob.glob(f"{TEST_IMAGE_PATH}/*.jpg") \
                 + glob.glob(f"{TEST_IMAGE_PATH}/*.jpeg") + glob.glob(f"{TEST_IMAGE_PATH}/*.bmp")\
                 + glob.glob(f"{TEST_IMAGE_PATH}/*.tif") + glob.glob(f"{TEST_IMAGE_PATH}/*.tiff")
@@ -1063,7 +1076,7 @@ if __name__ == "__main__":
     if P_img_list:
         coverage_ok, stats = analyze_overall_coverage(P_img_list, (img_h, img_w), grid=(4,4))
         # plot_coverage_heatmap(stats, (img_h, img_w), save_path=os.path.join(save_dir, "coverage_heatmap.png"))
-        plot_all_corners_scatter(P_img_list, (img_h, img_w), save_path=os.path.join(save_dir, "corners_scatter.png"))
+        # plot_all_corners_scatter(P_img_list, (img_h, img_w), save_path=os.path.join(save_dir, "corners_scatter.png"))
         if not coverage_ok:
             print("覆盖不均匀警告...")
                 # exit(1)
@@ -1158,4 +1171,3 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("高精度标定提醒：...")
     print("="*60)
-    
