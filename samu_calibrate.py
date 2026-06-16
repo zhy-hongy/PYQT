@@ -10,7 +10,9 @@ from scipy.optimize import least_squares
 import glob
 import os
 from typing import List, Tuple, Dict, Optional
-
+import json
+import datetime
+import matplotlib.pyplot as plt
 
 # ============================================================
 # 标定板类型
@@ -61,9 +63,9 @@ def compute_tilt_homography(tau: float, rho: float, d: float, lens_type: str = '
 
 def apply_distortion(xu: np.ndarray, yu: np.ndarray,
                      k1: float, k2: float, k3: float,
-                     p1: float, p2: float,
-                     alpha1: float, alpha2: float, tau: float) -> Tuple[np.ndarray, np.ndarray]:
-    """在未倾斜虚拟平面上施加径向和切向畸变（论文公式10-12）"""
+                     p1: float, p2: float) -> Tuple[np.ndarray, np.ndarray]:
+    """在未倾斜虚拟平面上施加径向和切向畸变（论文公式10-12）
+    输入输出均为归一化坐标（无量纲）"""
     r2 = xu*xu + yu*yu
     r4 = r2*r2
     r6 = r2*r4
@@ -75,17 +77,16 @@ def apply_distortion(xu: np.ndarray, yu: np.ndarray,
     y_tan = p1*(r2 + 2.0*yu*yu) + 2.0*p2*xu*yu
     # xd = x_rad + x_tan
     # yd = y_rad + y_tan
-    x_tilt = alpha1 * tau * xu
-    y_tilt = alpha2 * tau * yu
-    xd = x_rad + x_tan + x_tilt
-    yd = y_rad + y_tan + y_tilt
+    # x_tilt = alpha1 * tau * xu
+    # y_tilt = alpha2 * tau * yu
+    xd = x_rad + x_tan # + x_tilt
+    yd = y_rad + y_tan # + y_tilt
     return xd, yd
 
 def project_points_scheimpflug(P_w: np.ndarray, rvec: np.ndarray, tvec: np.ndarray,
                                c: float, d: float, tau: float, rho: float,
                                k1: float, k2: float, k3: float,
                                p1: float, p2: float,
-                               alpha1: float, alpha2: float,
                                sx: float, sy: float, cx: float, cy: float) -> np.ndarray:
     """
     完整的透视倾斜相机投影（论文模型）
@@ -100,14 +101,14 @@ def project_points_scheimpflug(P_w: np.ndarray, rvec: np.ndarray, tvec: np.ndarr
     xu = c * Xc / Zc
     yu = c * Yc / Zc
      # 在未倾斜平面上施加畸变
-    xd, yd = apply_distortion(xu, yu, k1, k2, k3, p1, p2, alpha1, alpha2, tau)
+    xd, yd = apply_distortion(xu, yu, k1, k2, k3, p1, p2)
     # 倾斜单应映射到实际传感器平面
     H = compute_tilt_homography(tau, rho, d, lens_type='perspective')
     pts_homo = H @ np.vstack((xd, yd, np.ones(N)))
     xt = pts_homo[0, :] / pts_homo[2, :]
     yt = pts_homo[1, :] / pts_homo[2, :]
 
-     # 像素坐标
+    # 像素坐标
     u = xt / sx + cx
     v = yt / sy + cy
     return np.vstack((u, v)).T
@@ -259,139 +260,6 @@ def filter_chessboard_corners(corners, pattern_size, max_line_error_px=2.0, max_
 
     return valid_mask
 
-# # ---------------------------------------------------------------------
-# def load_and_detect_calibration_images(
-#     image_dir: str,
-#     pattern_size: Tuple[int, int],
-#     square_size_mm: float,
-#     show_corners: bool = False,
-#     max_line_error_px=2.0,
-#     max_reject_ratio=0.5,
-#     debug=False
-# ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-#     """
-#     加载标定图片并检测角点/圆点
-#     支持棋盘格、对称圆点板、非对称圆点板
-#     """
-#     # -----------------------------------------------------------------
-#     # 搜索图片
-#     # -----------------------------------------------------------------
-#     extensions = ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff')
-#     image_paths = []
-#     for ext in extensions:
-#         image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
-#         image_paths.extend(glob.glob(os.path.join(image_dir, ext.upper())))
-#     image_paths = sorted(set(image_paths))
-#     if not image_paths:
-#         raise FileNotFoundError(f"在路径 {image_dir} 中没有找到图片！")
-    
-#     print(f"找到 {len(image_paths)} 张图片，正在提取角点/圆点...")
-
-#     cols, rows = pattern_size
-
-#     # -----------------------------------------------------------------
-#     # 生成世界坐标
-#     # -----------------------------------------------------------------
-#     if CALIB_BOARD_TYPE in (CALIB_BOARD_CHESSBOARD, CALIB_BOARD_CIRCLE_SYM):
-#         objp = np.zeros((cols * rows, 3), np.float64)
-#         objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_size_mm
-#     elif CALIB_BOARD_TYPE == CALIB_BOARD_CIRCLE_ASYM:
-#         objp = np.zeros((cols * rows, 3), np.float64)
-#         idx_pt = 0
-#         for r in range(rows):
-#             for c in range(cols):
-#                 objp[idx_pt, 0] = (2 * c + (r % 2)) * square_size_mm
-#                 objp[idx_pt, 1] = r * square_size_mm
-#                 idx_pt += 1
-#     else:
-#         raise ValueError("未知标定板类型")
-
-#     P_w_list = []
-#     P_img_list = []
-#     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-
-#     # -----------------------------------------------------------------
-#     # 循环处理每张图片
-#     # -----------------------------------------------------------------
-#     for idx, path in enumerate(image_paths):
-#         img = cv2.imread(path)
-#         if img is None:
-#             continue
-#         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-#         # ---------------- 检测标定板 ----------------
-#         ret = False
-#         corners_subpix = None
-
-#         if CALIB_BOARD_TYPE == CALIB_BOARD_CHESSBOARD:
-#             ret, corners = cv2.findChessboardCorners(
-#                 gray,
-#                 pattern_size,
-#                 flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
-#             )
-#             if ret:
-#                 corners_subpix = cv2.cornerSubPix(
-#                     gray, corners, (11,11), (-1,-1), criteria
-#                 )
-#                 if corners_subpix is None or len(corners_subpix) == 0:
-#                     continue
-#                 corners_subpix = corners_subpix.reshape(-1,2)
-
-#                 # 几何筛选
-#                 debug_this = debug and idx == 0
-#                 valid_mask = filter_chessboard_corners(
-#                     corners_subpix,
-#                     pattern_size,
-#                     max_line_error_px,
-#                     max_dist_ratio=0.5,
-#                     debug=debug_this
-#                 )
-#                 reject_ratio = 1.0 - np.sum(valid_mask) / len(valid_mask)
-#                 if reject_ratio > max_reject_ratio:
-#                     print(
-#                         f"{os.path.basename(path)}: 角点几何质量不合格 "
-#                         f"(剔除比例 {reject_ratio:.1%})，跳过该图像"
-#                     )
-#                     if debug_this and show_corners:
-#                         img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-#                         for i_pt, m in enumerate(valid_mask):
-#                             pt = tuple(corners_subpix[i_pt].astype(int))
-#                             color = (0,255,0) if m else (0,0,255)
-#                             cv2.circle(img_draw, pt, 3, color, -1)
-#                         cv2.imshow('角点质量 (绿=有效, 红=无效)', img_draw)
-#                         cv2.waitKey(0)
-#                         cv2.destroyAllWindows()
-#                     continue
-
-#         elif CALIB_BOARD_TYPE in (CALIB_BOARD_CIRCLE_SYM, CALIB_BOARD_CIRCLE_ASYM):
-#             flags = cv2.CALIB_CB_SYMMETRIC_GRID if CALIB_BOARD_TYPE == CALIB_BOARD_CIRCLE_SYM else cv2.CALIB_CB_ASYMMETRIC_GRID
-#             ret, corners = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
-#             if ret:
-#                 corners_subpix = corners.reshape(-1,2)
-
-#         else:
-#             raise ValueError("未知标定板类型")
-
-#         # ---------------- 保存有效角点/圆点 ----------------
-#         if ret and corners_subpix is not None:
-#             P_w_list.append(objp.copy())
-#             P_img_list.append(corners_subpix)
-#             print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
-
-#             if show_corners:
-#                 img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-#                 for pt in corners_subpix:
-#                     cv2.circle(img_draw, tuple(pt.astype(int)), 3, (0,255,0), -1)
-#                 cv2.imshow('角点/圆点', img_draw)
-#                 cv2.waitKey(0)
-
-#     cv2.destroyAllWindows()
-
-#     if len(P_w_list) < 3:
-#         raise ValueError(f"有效图片仅 {len(P_w_list)} 张，至少需要 3 张。")
-#     print(f"有效图片数量: {len(P_w_list)}")
-
-#     return P_w_list, P_img_list
 
 def load_and_detect_calibration_images(
     image_dir: str,
@@ -471,7 +339,7 @@ def load_and_detect_calibration_images(
         if ret and corners_subpix is not None:
             P_w_list.append(objp.copy())
             P_img_list.append(corners_subpix)
-            print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
+            # print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
             if show_corners:
                 img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
                 for pt in corners_subpix:
@@ -483,7 +351,6 @@ def load_and_detect_calibration_images(
         raise ValueError(f"有效图片仅 {len(P_w_list)} 张，至少需要 3 张。")
     print(f"有效图片数量: {len(P_w_list)}")
     return P_w_list, P_img_list
-
 
 # ============================================================
 #  初始外参估计（solvePnP）
@@ -502,7 +369,57 @@ def estimate_initial_extrinsics(P_w_list, P_img_list, c_init, cx_init, cy_init, 
             rvec = np.zeros(3)
             tvec = np.array([0, 0, 100.0])
         extrinsics.append((rvec.flatten(), tvec.flatten()))
-        print(f"  视图 {i}: t = [{tvec[0,0]:.2f}, {tvec[1,0]:.2f}, {tvec[2,0]:.2f}] mm")
+        # print(f"  视图 {i}: t = [{tvec[0,0]:.2f}, {tvec[1,0]:.2f}, {tvec[2,0]:.2f}] mm")
+    return extrinsics
+
+
+
+def estimate_initial_extrinsics_scheimpflug(P_w_list, P_img_list, cam_params):
+    """
+    使用当前投影模型（固定内参）为每个视图估计外参初值。
+    
+    参数:
+        P_w_list: 世界坐标点列表
+        P_img_list: 图像点列表
+        cam_params: 包含 c, d, tau, rho, sx, sy, cx, cy, k1, k2, k3, p1, p2 的字典
+                    （畸变系数可为0，因为初值估计对畸变不敏感）
+    
+    返回:
+        extrinsics: 列表，每个元素为 (rvec, tvec)
+    """
+    extrinsics = []
+    for P_w, P_img in zip(P_w_list, P_img_list):
+        # ---- 步骤1：用针孔模型获得粗略初值 ----
+        fx = cam_params['c'] / cam_params['sx']
+        fy = cam_params['c'] / cam_params['sy']
+        K_pinhole = np.array([[fx, 0, cam_params['cx']],
+                              [0, fy, cam_params['cy']],
+                              [0, 0, 1]], dtype=np.float64)
+        dist_pinhole = np.zeros(4)  # 无畸变
+        _, rvec, tvec = cv2.solvePnP(P_w, P_img, K_pinhole, dist_pinhole,
+                                     flags=cv2.SOLVEPNP_ITERATIVE)
+        # ---- 步骤2：用完整倾斜模型优化外参（固定内参） ----
+        def residual(x):
+            r = x[:3]
+            t = x[3:6]
+            proj = project_points_scheimpflug(
+                P_w, r, t,
+                cam_params['c'], cam_params['d'], cam_params['tau'], cam_params['rho'],
+                cam_params['k1'], cam_params['k2'], cam_params.get('k3', 0.0),
+                cam_params['p1'], cam_params['p2'],
+                cam_params['sx'], cam_params['sy'],
+                cam_params['cx'], cam_params['cy']
+            )
+            return (proj - P_img).ravel()
+
+        x0 = np.hstack([rvec.ravel(), tvec.ravel()])
+        # 使用 Levenberg-Marquardt 进行快速优化
+        res = least_squares(residual, x0, method='lm', max_nfev=200)
+        opt_rvec = res.x[:3]
+        opt_tvec = res.x[3:6]
+        extrinsics.append((opt_rvec, opt_tvec))
+        # print(f"视图外参优化: 初始重投影误差 = {np.sqrt(np.mean(residual(x0)**2)):.3f} px -> "
+        #       f"最终 = {np.sqrt(np.mean(residual(res.x)**2)):.3f} px")
     return extrinsics
 
 # ============================================================
@@ -527,6 +444,10 @@ def calibration_residuals(params, P_w_list, P_img_list, sx, sy,
         c, d, tau, rho, cx, cy, k1, k2, p1, p2 = params[0:10]
         k3=alpha1=alpha2=0.0
         int_len = 10
+    elif distortion_model == 'full_k3':
+        c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2 = params[0:11]
+        alpha1=alpha2=0.0
+        int_len = 11
     elif distortion_model == 'full_tilt':
         c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2, alpha1, alpha2 = params[0:13]
         int_len = 13
@@ -540,8 +461,7 @@ def calibration_residuals(params, P_w_list, P_img_list, sx, sy,
         tvec = params[idx+3:idx+6]
         P_pred = project_points_scheimpflug(P_w_list[i], rvec, tvec,
                                             c, d, tau, rho,
-                                            k1, k2, k3, p1, p2, 
-                                            alpha1, alpha2,
+                                            k1, k2, k3, p1, p2,
                                             sx, sy, cx, cy)
         diff = P_pred - P_img_list[i]
         residuals.extend(diff.flatten())
@@ -557,7 +477,7 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
                           lens_type: str = 'perspective') -> Dict:
     h, w = image_shape
     c0 = init_intrinsic.get('c', 8.0)
-    d0 = init_intrinsic.get('d', c0 / np.cos(init_intrinsic.get('tau', 0.0)))
+    d0 = init_intrinsic.get('d', c0)
     tau0 = init_intrinsic.get('tau', 0.0)
     rho0 = init_intrinsic.get('rho', 0.0)
     cx0 = init_intrinsic.get('cx', w / 2.0)
@@ -574,20 +494,32 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
     elif distortion_model == 'k2':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0]
         lower_bounds = [5.0, 7.5, -np.radians(30), -np.pi, 0, 0, -1.0, -1.0]
-        upper_bounds = [15.0, 9.5, np.radians(30), np.pi, w-1, h-1, 1.0, 1.0]
+        upper_bounds = [15.0, 9.5, np.radians(30),  np.pi, w-1, h-1, 1.0, 1.0]
     elif distortion_model == 'full':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0]
-        lower_bounds = [5.0, 15.0, np.radians(9.3)-1e-8, -np.pi, 0, 0, -1.0, -1.0, -0.5, -0.5]
-        upper_bounds = [15.0, 25.0, np.radians(9.3)+1e-8, np.pi, w-1, h-1, 1.0, 1.0, 0.5, 0.5]
+        lower_bounds = [ 5.0,  5.0, -np.radians(30), -np.pi, 0,   492, -1.0, -1.0, -0.5, -0.5]
+        upper_bounds = [15.0, 25.0,  np.radians(30),  np.pi, w-1, 532, 1.0, 1.0, 0.5, 0.5]
+    elif distortion_model == 'full_k3':
+        init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        lower_bounds = [5.0,   5.0, -np.radians(30), -np.pi, 0,   492, -1.0, -1.0, -1.0, -0.5, -0.5]
+        upper_bounds = [15.0, 50.0,  np.radians(30),  np.pi, w-1, h-1,  1.0,  1.0,  1.0,  0.5,  0.5]
     else:  # 'full_tilt'
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 0, 0,
                         -1.0, -1.0, -1.0, -0.5, -0.5, -2.0, -2.0]
         upper_bounds = [15.0, 15.0, np.radians(30), np.pi, w-1, h-1,
                         1.0, 1.0, 1.0, 0.5, 0.5, 5.0, 5.0]
-    
-    extrinsics_list = estimate_initial_extrinsics(P_w_list, P_img_list,
-                                                   c0, cx0, cy0, sx, sy)
+
+
+    # 构建一个临时参数字典（用于初值估计）
+    tmp_params = {
+        'c': c0, 'd': d0, 'tau': tau0, 'rho': rho0,
+        'cx': cx0, 'cy': cy0,
+        'k1': 0.0, 'k2': 0.0, 'k3': 0.0, 'p1': 0.0, 'p2': 0.0,
+        'sx': sx, 'sy': sy
+    }
+    extrinsics_list = estimate_initial_extrinsics_scheimpflug(P_w_list, P_img_list, tmp_params)
+
     ext_params = []
     for rvec, tvec in extrinsics_list:
         ext_params.extend(rvec)
@@ -613,12 +545,13 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
         args=(P_w_list, P_img_list, sx, sy, distortion_model, lens_type),
         method='trf',
         loss='soft_l1',
+        # loss='linear',
         f_scale=1.0,
         xtol=1e-12,
         ftol=1e-12,
         gtol=1e-12,
         max_nfev=5000,
-        verbose=2
+        verbose=1
     )
     
     if not result.success:
@@ -640,6 +573,10 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
         c, d, tau, rho, cx, cy, k1, k2, p1, p2 = result.x[0:10]
         k3 = alpha1 = alpha2 = 0.0
         int_len = 10
+    elif distortion_model == 'full_k3':
+        c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2 = result.x[0:11]
+        alpha1 = alpha2 = 0.0
+        int_len = 11
     else:
         c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2, alpha1, alpha2 = result.x[0:13]
         int_len = 13
@@ -652,7 +589,7 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
         tvec = result.x[idx+3:idx+6]
         P_pred = project_points_scheimpflug(P_w_list[i], rvec, tvec,
                                             c, d, tau, rho,
-                                            k1, k2, k3, p1, p2, alpha1, alpha2,
+                                            k1, k2, k3, p1, p2,
                                             sx, sy, cx, cy)
         diff = P_pred - P_img_list[i]
         total_err_sq += np.sum(diff**2)
@@ -671,13 +608,15 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
         print(f"  p1 = {p1:.6f}, p2 = {p2:.6f}")
     if distortion_model == 'full_tilt':
         print(f"  k3 = {k3:.6f}, alpha1 = {alpha1:.6f}, alpha2 = {alpha2:.6f}")
+    if distortion_model in ('full_k3'):
+        print(f"  k1 = {k1:.6f}, k2 = {k2:.6f}, k3 = {k3:.6f}, p1 = {p1:.6f}, p2 = {p2:.6f}")
     
     cam_params = {
         'c': c, 'd': d, 'tau': tau, 'rho': rho,
         'cx': cx, 'cy': cy,
         'k1': k1, 'k2': k2, 'k3': k3,
         'p1': p1, 'p2': p2,
-        'alpha1': alpha1, 'alpha2': alpha2,
+        # 'alpha1': alpha1, 'alpha2': alpha2,
         'sx': sx, 'sy': sy,
         'image_shape': image_shape,
         'rmse': rmse,
@@ -690,6 +629,7 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
 # ============================================================
 #  图像校正
 # ============================================================
+
 def rectify_tilt_image(img: np.ndarray, cam_params: Dict, output_size: Optional[Tuple[int,int]] = None) -> np.ndarray:
     h_in, w_in = img.shape[:2]
     if output_size is None:
@@ -754,358 +694,115 @@ def rectify_tilt_image(img: np.ndarray, cam_params: Dict, output_size: Optional[
                     rectified[v_out, u_out] = np.clip(val, 0, 255)
     return rectified
 
-
-
-
-def image_to_world_point(u, v, rvec, tvec, cam_params):
-    """
-    将图像点逆向投影到世界坐标系中的Z=0平面
-    
-    参数:
-        u, v: 图像坐标（像素）
-        rvec: 旋转向量（3,）
-        tvec: 平移向量（3,）
-        cam_params: 相机参数字典
-    
-    返回:
-        世界坐标点 (3,) 或 None
-    """
-    # 提取参数
-    sx, sy = cam_params['sx'], cam_params['sy']
-    c = cam_params['c']
-    d = cam_params['d']
-    tau = cam_params['tau']
-    rho = cam_params['rho']
-    cx = cam_params['cx']
-    cy = cam_params['cy']
-    k1 = cam_params['k1']
-    k2 = cam_params['k2']
-    k3 = cam_params.get('k3', 0.0)
-    p1 = cam_params['p1']
-    p2 = cam_params['p2']
-    alpha1 = cam_params.get('alpha1', 0.0)
-    alpha2 = cam_params.get('alpha2', 0.0)
-    
-    try:
-        # 1. 像素坐标 -> 传感器物理坐标
-        xd = (u - cx) * sx
-        yd = (v - cy) * sy
-        
-        # 2. 倾斜映射逆变换
-        H = compute_tilt_homography(tau, rho, d, lens_type='perspective')
-        H_inv = np.linalg.inv(H)
-        
-        pt = H_inv @ np.array([xd, yd, 1.0])
-        xt = pt[0] / pt[2]
-        yt = pt[1] / pt[2]
-        
-        # 3. 畸变校正（迭代法）
-        # 简化的畸变校正：使用固定点迭代
-        xu, yu = undistort_point(xt, yt, k1, k2, k3, p1, p2, alpha1, alpha2, tau)
-        
-        # 4. 未倾斜平面上的理想点 -> 相机坐标系
-        Zc = c  # 假设在参考距离处
-        Xc = xu * Zc / c
-        Yc = yu * Zc / c
-        
-        P_c = np.array([Xc, Yc, Zc])
-        
-        # 5. 相机坐标系 -> 世界坐标系
-        R = rodrigues_to_rotation_matrix(rvec)
-        P_w = R.T @ (P_c - tvec)
-        
-        # 假设标定板在Z=0平面
-        if abs(P_w[2]) > 1e-6:
-            # 投影到Z=0平面
-            scale = -P_w[2] / (R.T @ np.array([0, 0, 1]))[2] if False else 1.0
-            # 简化：直接返回
-            return P_w
-        
-        return P_w
-        
-    except Exception as e:
-        return None
-
-
-def undistort_point(x, y, k1, k2, k3, p1, p2, alpha1, alpha2, tau, max_iter=10):
-    """
-    畸变校正（迭代法）
-    """
-    xu, yu = x, y
-    
-    for _ in range(max_iter):
-        r2 = xu*xu + yu*yu
-        r4 = r2*r2
-        r6 = r2*r4
-        
-        radial = 1.0 + k1*r2 + k2*r4 + k3*r6
-        
-        # 计算当前点的畸变
-        x_rad = xu * radial
-        y_rad = yu * radial
-        
-        x_tan = 2.0*p1*xu*yu + p2*(r2 + 2.0*xu*xu)
-        y_tan = p1*(r2 + 2.0*yu*yu) + 2.0*p2*xu*yu
-        
-        x_tilt_comp = alpha1 * tau * xu
-        y_tilt_comp = alpha2 * tau * yu
-        
-        xd = x_rad + x_tan + x_tilt_comp
-        yd = y_rad + y_tan + y_tilt_comp
-        
-        # 更新估计值
-        error_x = xd - x
-        error_y = yd - y
-        
-        if abs(error_x) < 1e-8 and abs(error_y) < 1e-8:
-            break
-        
-        # 简单迭代校正（实际应用中可用牛顿法）
-        xu = xu - error_x * 0.5
-        yu = yu - error_y * 0.5
-    
-    return xu, yu
-
-
-def compute_grid_errors(points_3d, square_size_mm, tolerance=0.2):
-    """
-    计算棋盘格或对称圆点板的邻接点距离误差
-    """
-    errors = []
-    n_points = len(points_3d)
-    
-    # 假设点是按行优先顺序排列的
-    # 需要根据实际的标定板布局来确定邻接关系
-    cols, rows = 8, 11  # 这里应该从实际配置获取
-    
-    # 水平邻接
-    for r in range(rows):
-        for c in range(cols - 1):
-            idx1 = r * cols + c
-            idx2 = r * cols + c + 1
-            if idx1 < n_points and idx2 < n_points:
-                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
-                if abs(dist - square_size_mm) < square_size_mm * tolerance:
-                    errors.append(dist - square_size_mm)
-    
-    # 垂直邻接
-    for c in range(cols):
-        for r in range(rows - 1):
-            idx1 = r * cols + c
-            idx2 = (r + 1) * cols + c
-            if idx1 < n_points and idx2 < n_points:
-                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
-                if abs(dist - square_size_mm) < square_size_mm * tolerance:
-                    errors.append(dist - square_size_mm)
-    
-    return errors
-
-
-def compute_asym_board_errors(points_3d, square_size_mm, tolerance=0.2):
-    """
-    计算非对称圆点板的邻接点距离误差
-    """
-    errors = []
-    n_points = len(points_3d)
-    
-    # 非对称圆点板的特殊处理
-    cols, rows = 8, 11  # 从配置获取
-    
-    for r in range(rows):
-        for c in range(cols - 1):
-            idx1 = r * cols + c
-            idx2 = r * cols + c + 1
-            if idx1 < n_points and idx2 < n_points:
-                # 非对称板的水平间距可能是2倍方格尺寸
-                expected_dist = square_size_mm * (2 if r % 2 == 1 else 1)
-                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
-                if abs(dist - expected_dist) < expected_dist * tolerance:
-                    errors.append(dist - expected_dist)
-    
-    # 垂直邻接
-    for c in range(cols):
-        for r in range(rows - 1):
-            idx1 = r * cols + c
-            idx2 = (r + 1) * cols + c
-            if idx1 < n_points and idx2 < n_points:
-                dist = np.linalg.norm(points_3d[idx2] - points_3d[idx1])
-                if abs(dist - square_size_mm) < square_size_mm * tolerance:
-                    errors.append(dist - square_size_mm)
-    
-    return errors
-
-# ============================================================
-#  验证函数：使用独立测试图评估标定质量
-# ============================================================
-
-# def validate_scheimpflug_calibration(
-#     image_path,
-#     cam_params,
-#     pattern_size,
-#     square_size_mm,
-#     show=False
-# ):
-#     import cv2
-#     import numpy as np
-
-#     # 1. 读图 + 角点检测
-#     img = cv2.imread(image_path)
-#     if img is None:
-#         raise ValueError("图像读取失败")
-
-#     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-#     ret, corners = cv2.findChessboardCorners(
-#         gray, pattern_size,
-#         flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
-#     )
-#     if not ret:
-#         raise RuntimeError("角点检测失败")
-
-#     corners = cv2.cornerSubPix(
-#         gray, corners, (11, 11), (-1, -1),
-#         criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-#     ).reshape(-1, 2)
-
-#     # 2. 世界坐标
-#     cols, rows = pattern_size
-#     objp = np.zeros((cols * rows, 3), np.float64)
-#     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_size_mm
-
-#     # 3. 利用标定好的内参和畸变，通过 solvePnP 估计外参
-#     #   注意：这里应使用完整的 Scheimpflug 投影模型，但 solvePnP 需要提供初始内参
-#     #   我们先用针孔模型初始化外参（近似），然后将该外参作为初始值，再用 Scheimpflug 投影进行精化（可选）
-#     #   或者直接使用 solvePnP 配合标定出的内参矩阵（虽然模型不是严格针孔，但可作为初值）
-#     fx = cam_params['c'] / cam_params['sx']
-#     fy = cam_params['c'] / cam_params['sy']
-#     K_pinhole = np.array([
-#         [fx, 0, cam_params['cx']],
-#         [0, fy, cam_params['cy']],
-#         [0, 0, 1]
-#     ], dtype=np.float64)
-#     dist_pinhole = np.array([cam_params['k1'], cam_params['k2'], 
-#                               cam_params['p1'], cam_params['p2']], dtype=np.float64)
-    
-#     _, rvec, tvec = cv2.solvePnP(objp, corners, K_pinhole, dist_pinhole,
-#                                  flags=cv2.SOLVEPNP_ITERATIVE)
-    
-#     # 如果希望更精确的外参，可以基于完整 Scheimpflug 模型进行非线性优化（仅优化外参）
-#     # 为简化，这里直接使用 solvePnP 的结果即可，后续投影会使用完整的 Scheimpflug 模型
-
-#     # 4. 使用完整 Scheimpflug 模型投影
-#     proj = project_points_scheimpflug(
-#         objp,
-#         rvec.ravel(),
-#         tvec.ravel(),
-#         cam_params['c'],
-#         cam_params['d'],
-#         cam_params['tau'],
-#         cam_params['rho'],
-#         cam_params['k1'],
-#         cam_params['k2'],
-#         cam_params.get('k3', 0.0),
-#         cam_params['p1'],
-#         cam_params['p2'],
-#         cam_params.get('alpha1', 0.0),
-#         cam_params.get('alpha2', 0.0),
-#         cam_params['sx'],
-#         cam_params['sy'],
-#         cam_params['cx'],
-#         cam_params['cy']
-#     )
-
-#     # 5. 误差计算
-#     errors = np.linalg.norm(proj - corners, axis=1)
-#     mean_err = np.mean(errors)
-#     rms_err = np.sqrt(np.mean(errors ** 2))
-#     max_err = np.max(errors)
-
-#     print("\n====================")
-#     print("验证结果（无优化真实误差）")
-#     print("====================")
-#     print(f"Mean: {mean_err:.4f} px")
-#     print(f"RMS : {rms_err:.4f} px")
-#     print(f"Max : {max_err:.4f} px")
-#     print("OK" if rms_err < 0.5 else "FAIL")
-
-#     # 6. 可视化
-#     if show:
-#         vis = img.copy()
-#         for p1, p2 in zip(corners, proj):
-#             p1 = tuple(p1.astype(int))
-#             p2 = tuple(p2.astype(int))
-#             cv2.circle(vis, p1, 3, (0, 255, 0), -1)   # 绿色为检测点
-#             cv2.circle(vis, p2, 3, (0, 0, 255), -1)   # 红色为投影点
-#             cv2.line(vis, p1, p2, (255, 0, 0), 1)
-#         cv2.imshow("validation", vis)
-#         cv2.waitKey(0)
-#         cv2.destroyAllWindows()
-
-#     return {
-#         "mean": float(mean_err),
-#         "rms": float(rms_err),
-#         "max": float(max_err),
-#         "is_good": bool(rms_err < 0.5),
-#         "rvec": rvec.ravel().tolist(),
-#         "tvec": tvec.ravel().tolist()
-#     }
-
-
 def validate_scheimpflug_calibration(
-    image_path,
+    image_paths,  # 可以是字符串(单张图片路径)或列表(多张图片路径)
     cam_params,
     pattern_size,
     square_size_mm,
     show=False
 ):
-    # 1. 读图 + 角点检测
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError("图像读取失败")
+    """
+    验证沙姆相机标定精度，支持多张图像，输出每张图的详细误差统计。
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    参数:
+        image_paths: str 或 List[str] - 图像路径或路径列表
+        cam_params: dict - 标定参数
+        pattern_size: tuple (cols, rows) - 棋盘格内角点数量
+        square_size_mm: float - 棋盘格方格边长 (mm)
+        show: bool - 是否显示第一张图像的可视化结果
 
-    ret, corners = cv2.findChessboardCorners(
-        gray, pattern_size,
-        flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
-    )
-    if not ret:
-        raise RuntimeError("角点检测失败")
+    返回:
+        dict: {
+            'per_image': [{'path': str, 'mean': float, 'rms': float, 'max': float,
+                           'dx_mean': float, 'dx_std': float,
+                           'dy_mean': float, 'dy_std': float, ...}, ...],
+            'overall': {'mean': float, 'rms': float, 'max': float,
+                        'dx_mean': float, 'dx_std': float,
+                        'dy_mean': float, 'dy_std': float}
+        }
+    """
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
 
-    corners = cv2.cornerSubPix(
-        gray, corners, (11, 11), (-1, -1),
-        criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    ).reshape(-1, 2)
-
-    # 2. 世界坐标
     cols, rows = pattern_size
-    objp = np.zeros((cols * rows, 3), np.float64)
+    # 世界坐标点 (Z=0)
+    objp = np.zeros((cols * rows, 3), dtype=np.float64)
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square_size_mm
 
-    # 3. 利用标定好的内参和畸变，通过 solvePnP 估计外参初值
-    fx = cam_params['c'] / cam_params['sx']
-    fy = cam_params['c'] / cam_params['sy']
-    K_pinhole = np.array([
-        [fx, 0, cam_params['cx']],
-        [0, fy, cam_params['cy']],
-        [0, 0, 1]
-    ], dtype=np.float64)
-    dist_pinhole = np.array([cam_params['k1'], cam_params['k2'], 
-                             cam_params['p1'], cam_params['p2']], dtype=np.float64)
-    
-    _, rvec_init, tvec_init = cv2.solvePnP(objp, corners, K_pinhole, dist_pinhole,
-                                           flags=cv2.SOLVEPNP_ITERATIVE)
-    
-    # 组合初值 [rvec_x, rvec_y, rvec_z, tvec_x, tvec_y, tvec_z]
-    x0 = np.hstack((rvec_init.ravel(), tvec_init.ravel()))
+    all_errors = []  # 存储每张图像的所有角点误差（用于整体统计）
+    per_image_stats = []
 
-    # 4. 定义残差函数（仅优化外参）
-    def loss_function(ext_params):
-        rvec_opt = ext_params[0:3]
-        tvec_opt = ext_params[3:6]
-        
-        # 调用完整的 Scheimpflug 模型进行重投影
-        proj_pts = project_points_scheimpflug(
+    for img_path in image_paths:
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"警告: 无法读取图像 {img_path}，跳过")
+            continue
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 检测角点
+        ret, corners = cv2.findChessboardCorners(
+            gray, pattern_size,
+            flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+        )
+        if not ret:
+            print(f"警告: {img_path} 角点检测失败，跳过")
+            continue
+
+        corners = cv2.cornerSubPix(
+            gray, corners, (11, 11), (-1, -1),
+            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+        ).reshape(-1, 2)
+
+        # 使用优化后的外参（调用 least_squares 进行单图外参优化）
+        # 注意：这里为了每张图独立验证，会重新估计外参（固定内参）
+        # 这样得到的是该图像的最佳拟合外参下的误差，而不是全局外参。
+        # 如果希望使用全局外参，可以跳过此步，但需要事先有全局外参。
+        # 为简单起见，这里使用 solvePnP 初值 + 优化外参（与之前 validation 逻辑一致）
+
+        fx = cam_params['c'] / cam_params['sx']
+        fy = cam_params['c'] / cam_params['sy']
+        K_pinhole = np.array([
+            [fx, 0, cam_params['cx']],
+            [0, fy, cam_params['cy']],
+            [0, 0, 1]
+        ], dtype=np.float64)
+        dist_pinhole = np.array([cam_params['k1'], cam_params['k2'],
+                                 cam_params['p1'], cam_params['p2']], dtype=np.float64)
+
+        _, rvec_init, tvec_init = cv2.solvePnP(objp, corners, K_pinhole, dist_pinhole,
+                                               flags=cv2.SOLVEPNP_ITERATIVE)
+
+        def loss_function(ext_params):
+            rvec_opt = ext_params[0:3]
+            tvec_opt = ext_params[3:6]
+            proj_pts = project_points_scheimpflug(
+                objp,
+                rvec_opt,
+                tvec_opt,
+                cam_params['c'],
+                cam_params['d'],
+                cam_params['tau'],
+                cam_params['rho'],
+                cam_params['k1'],
+                cam_params['k2'],
+                cam_params.get('k3', 0.0),
+                cam_params['p1'],
+                cam_params['p2'],
+                cam_params['sx'],
+                cam_params['sy'],
+                cam_params['cx'],
+                cam_params['cy']
+            )
+            return (proj_pts - corners).ravel()
+
+        x0 = np.hstack((rvec_init.ravel(), tvec_init.ravel()))
+        res = least_squares(loss_function, x0, method='lm')
+        rvec_opt = res.x[0:3]
+        tvec_opt = res.x[3:6]
+
+        # 计算投影和误差
+        proj = project_points_scheimpflug(
             objp,
             rvec_opt,
             tvec_opt,
@@ -1118,101 +815,220 @@ def validate_scheimpflug_calibration(
             cam_params.get('k3', 0.0),
             cam_params['p1'],
             cam_params['p2'],
-            cam_params.get('alpha1', 0.0),
-            cam_params.get('alpha2', 0.0),
             cam_params['sx'],
             cam_params['sy'],
             cam_params['cx'],
             cam_params['cy']
         )
-        # 返回一维残差数组 (x1-u1, y1-v1, x2-u2, y2-v2, ...)
-        return (proj_pts - corners).ravel()
 
-    # 5. 执行非线性优化精化外参
-    # 使用 Levenberg-Marquardt (lm) 算法，适合无边界约束的最小二乘问题
-    res = least_squares(loss_function, x0, method='lm')
-    
-    # 提取优化后的外参
-    rvec_optimized = res.x[0:3]
-    tvec_optimized = res.x[3:6]
-    print(f"优化前rvec_init: {rvec_init.ravel()}, tvec_init: {tvec_init.ravel()}")
-    print(f"优化后rvec_optimized: {rvec_optimized}, tvec_optimized: {tvec_optimized}")
-    # 6. 使用优化后的外参计算最终投影和误差
-    proj = project_points_scheimpflug(
-        objp,
-        rvec_optimized,
-        tvec_optimized,
-        cam_params['c'],
-        cam_params['d'],
-        cam_params['tau'],
-        cam_params['rho'],
-        cam_params['k1'],
-        cam_params['k2'],
-        cam_params.get('k3', 0.0),
-        cam_params['p1'],
-        cam_params['p2'],
-        cam_params.get('alpha1', 0.0),
-        cam_params.get('alpha2', 0.0),
-        cam_params['sx'],
-        cam_params['sy'],
-        cam_params['cx'],
-        cam_params['cy']
-    )
+        errors = np.linalg.norm(proj - corners, axis=1)
+        dx = proj[:, 0] - corners[:, 0]
+        dy = proj[:, 1] - corners[:, 1]
 
-    errors = np.linalg.norm(proj - corners, axis=1)
-    mean_err = np.mean(errors)
-    rms_err = np.sqrt(np.mean(errors ** 2))
-    max_err = np.max(errors)
+        stats = {
+            'path': img_path,
+            'mean': float(np.mean(errors)),
+            'rms': float(np.sqrt(np.mean(errors**2))),
+            'max': float(np.max(errors)),
+            'dx_mean': float(np.mean(dx)),
+            'dx_std': float(np.std(dx)),
+            'dy_mean': float(np.mean(dy)),
+            'dy_std': float(np.std(dy)),
+            'num_corners': len(corners)
+        }
+        per_image_stats.append(stats)
+        all_errors.extend(errors)
+        all_dx = dx if 'all_dx' not in locals() else np.concatenate((all_dx, dx))
+        all_dy = dy if 'all_dy' not in locals() else np.concatenate((all_dy, dy))
 
-    print("\n====================")
-    print("验证结果（外参已基于Scheimpflug模型优化）")
-    print("====================")
-    print(f"Mean: {mean_err:.4f} px")
-    print(f"RMS : {rms_err:.4f} px")
-    print(f"Max : {max_err:.4f} px")
-    print("OK" if rms_err < 0.5 else "FAIL")
+        # 可视化第一张图像（如果show=True）
+        if show and img_path == image_paths[0]:
+            vis = img.copy()
+            for p_det, p_proj in zip(corners, proj):
+                p_det = tuple(p_det.astype(int))
+                p_proj = tuple(p_proj.astype(int))
+                cv2.circle(vis, p_det, 3, (0, 255, 0), -1)
+                cv2.circle(vis, p_proj, 3, (0, 0, 255), -1)
+                cv2.line(vis, p_det, p_proj, (255, 0, 0), 1)
+            cv2.imshow("Validation (Green: detected, Red: projected)", vis)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
-    # 7. 可视化
-    if show:
-        vis = img.copy()
-        for p1, p2 in zip(corners, proj):
-            p1 = tuple(p1.astype(int))
-            p2 = tuple(p2.astype(int))
-            cv2.circle(vis, p1, 3, (0, 255, 0), -1)   # 绿色为检测点
-            cv2.circle(vis, p2, 3, (0, 0, 255), -1)   # 红色为投影点
-            cv2.line(vis, p1, p2, (255, 0, 0), 1)
-        cv2.imshow("validation", vis)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+    if not per_image_stats:
+        raise RuntimeError("没有成功处理任何图像")
+
+    # 整体统计
+    overall_errors = np.array(all_errors)
+    overall_dx = np.array(all_dx)
+    overall_dy = np.array(all_dy)
+
+    overall = {
+        'mean': float(np.mean(overall_errors)),
+        'rms': float(np.sqrt(np.mean(overall_errors**2))),
+        'max': float(np.max(overall_errors)),
+        'dx_mean': float(np.mean(overall_dx)),
+        'dx_std': float(np.std(overall_dx)),
+        'dy_mean': float(np.mean(overall_dy)),
+        'dy_std': float(np.std(overall_dy))
+    }
+
+    # 打印每张图的统计
+    # print("\n==================== 逐图像验证统计 ====================")
+    # for s in per_image_stats:
+    #     print(f"图像: {os.path.basename(s['path'])}")
+    #     print(f"  平均误差: {s['mean']:.4f} px, RMS: {s['rms']:.4f} px, 最大: {s['max']:.4f} px")
+    #     print(f"  dx: 均值={s['dx_mean']:.4f}, 标准差={s['dx_std']:.4f}")
+    #     print(f"  dy: 均值={s['dy_mean']:.4f}, 标准差={s['dy_std']:.4f}")
+    #     print("")
+    print("==================== 整体统计 ====================")
+    print(f"整体平均误差: {overall['mean']:.4f} px")
+    print(f"整体RMS: {overall['rms']:.4f} px")
+    print(f"整体最大误差: {overall['max']:.4f} px")
+    print(f"整体dx: 均值={overall['dx_mean']:.4f}, 标准差={overall['dx_std']:.4f}")
+    print(f"整体dy: 均值={overall['dy_mean']:.4f}, 标准差={overall['dy_std']:.4f}")
+    print("===================================================\n")
 
     return {
-        "mean": float(mean_err),
-        "rms": float(rms_err),
-        "max": float(max_err),
-        "is_good": bool(rms_err < 0.5),
-        "rvec": rvec_optimized.tolist(),
-        "tvec": tvec_optimized.tolist()
+        'per_image': per_image_stats,
+        'overall': overall
     }
+
+def analyze_overall_coverage(P_img_list, image_shape, grid=(4,4), verbose=True):
+    """
+    分析多张标定图像中所有角点在图像上的整体覆盖情况。
+    
+    参数:
+        P_img_list: list of (N_i, 2) 角点坐标（像素）列表
+        image_shape: (height, width)
+        grid: (rows, cols) 将图像划分的网格数
+        verbose: 是否打印详细统计
+    
+    返回:
+        coverage_ok: bool，是否满足均匀覆盖（可根据实际情况设定判断标准）
+        stats: dict，包含网格计数、比例等
+    """
+    h, w = image_shape
+    rows, cols = grid
+    cell_h = h / rows
+    cell_w = w / cols
+    
+    # 统计每个网格的总角点数
+    grid_counts = np.zeros((rows, cols), dtype=int)
+    total_corners = 0
+    
+    for corners in P_img_list:
+        for (x, y) in corners:
+            # 边界处理
+            col = int(x // cell_w) if x < w else cols-1
+            row = int(y // cell_h) if y < h else rows-1
+            col = min(col, cols-1)
+            row = min(row, rows-1)
+            grid_counts[row, col] += 1
+            total_corners += 1
+    
+    if total_corners == 0:
+        print("无角点数据！")
+        return False, {}
+    
+    grid_ratios = grid_counts / total_corners
+    
+    # 统计覆盖指标
+    min_ratio = np.min(grid_ratios)
+    max_ratio = np.max(grid_ratios)
+    mean_ratio = np.mean(grid_ratios)
+    std_ratio = np.std(grid_ratios)
+    non_zero_grids = np.sum(grid_counts > 0)
+    total_grids = rows * cols
+    
+    if verbose:
+        print("\n========== 整体角点覆盖分析 ==========")
+        print(f"总角点数: {total_corners}")
+        print(f"图像区域: {w} x {h} 像素，划分 {rows}x{cols} 网格")
+        print(f"每个网格的角点占比:")
+        for r in range(rows):
+            row_str = " ".join([f"{grid_ratios[r,c]:.2%}" for c in range(cols)])
+            print(f"  行{r}: {row_str}")
+        print(f"最小网格占比: {min_ratio:.2%}")
+        print(f"最大网格占比: {max_ratio:.2%}")
+        print(f"平均网格占比: {mean_ratio:.2%} ± {std_ratio:.2%}")
+        print(f"覆盖网格数: {non_zero_grids}/{total_grids} ({non_zero_grids/total_grids:.1%})")
+        print("====================================\n")
+    
+    # 判断覆盖是否合格（可根据需要调整阈值）
+    # 例如：要求覆盖所有网格，且最小占比不低于 2%（保证每个区域都有足够数据）
+    coverage_ok = (non_zero_grids == total_grids) and (min_ratio >= 0.02)
+    if not coverage_ok:
+        print("警告：整体角点覆盖不足！建议增加标定板在不同区域（边缘、角落）的图像。")
+    
+    stats = {
+        'total_corners': total_corners,
+        'grid_counts': grid_counts,
+        'grid_ratios': grid_ratios,
+        'min_ratio': min_ratio,
+        'max_ratio': max_ratio,
+        'mean_ratio': mean_ratio,
+        'std_ratio': std_ratio,
+        'non_zero_grids': non_zero_grids,
+        'total_grids': total_grids,
+        'coverage_ok': coverage_ok
+    }
+    return coverage_ok, stats
+
+
+
+def plot_coverage_heatmap(stats, image_shape, save_path=None):
+    grid_counts = stats['grid_counts']
+    plt.imshow(grid_counts, cmap='hot', interpolation='nearest')
+    plt.colorbar(label='角点数量')
+    plt.title('角点覆盖热力图')
+    if save_path:
+        plt.savefig(save_path)
+    else:
+        plt.show()
+
+def plot_all_corners_scatter(P_img_list, image_shape, save_path=None):
+    plt.figure(figsize=(8, 6))
+    for corners in P_img_list:
+        plt.scatter(corners[:,0], corners[:,1], s=1, alpha=0.5, c='blue')
+    plt.xlim(0, image_shape[1])
+    plt.ylim(image_shape[0], 0)   # 图像原点在左上角，需要翻转y轴
+    plt.gca().invert_yaxis()
+    plt.xlabel('x (pixel)')
+    plt.ylabel('y (pixel)')
+    plt.title('All corners from all images')
+    # if save_path:
+        # plt.savefig(save_path)
+    plt.show()
+    
 # ============================================================
 #  主程序
 # ============================================================
 if __name__ == "__main__":
-    IMAGE_DIR = r"C:\Users\1\Pictures\Camera Roll"  # 请替换为实际的标定图片目录
-    PATTERN_SIZE = (11, 8)          # 注意：请根据实际棋盘格内角点行列数设置
+    IMAGE_DIR = r"./saved_images"  # 请替换为实际的标定图片目录
+    PATTERN_SIZE = (11, 8)         # 注意：请根据实际棋盘格内角点行列数设置
     SQUARE_SIZE_MM = 5
     PIXEL_SIZE_X_MM = 0.004
     PIXEL_SIZE_Y_MM = 0.004
     INIT_INTRINSIC = {
-        'c': 8.0, 'd': 8.2, 'tau': np.radians(9.0), 'rho': np.radians(0.0),
+        'c': 8.7, 'd': 15, 'tau': np.radians(9.3), 'rho': np.radians(0.0),
         'cx': 640.0, 'cy': 512.0
     }
-    DISTORTION_MODEL = 'full'# 'none', 'k1', 'k2', 'full', 'full_tilt'
+    DISTORTION_MODEL = 'full_k3'# 'none', 'k1', 'k2', 'full', 'full_k3'
     LENS_TYPE = 'perspective'
     SHOW_CORNERS = False
-    # 放宽筛选参数
+    # 放宽筛选参数 
     MAX_LINE_ERROR_PX = 1.0
     MAX_REJECT_RATIO = 0.6
     DEBUG_CORNERS = True
+    
+    # 验证用测试图片路径
+    TEST_IMAGE_PATH = r"C:\Users\1\Pictures\Camera Roll"
+    test_images = glob.glob(f"{TEST_IMAGE_PATH}/*.png") + glob.glob(f"{TEST_IMAGE_PATH}/*.jpg") \
+                + glob.glob(f"{TEST_IMAGE_PATH}/*.jpeg") + glob.glob(f"{TEST_IMAGE_PATH}/*.bmp")\
+                + glob.glob(f"{TEST_IMAGE_PATH}/*.tif") + glob.glob(f"{TEST_IMAGE_PATH}/*.tiff")
+    # -------------------- 创建结果保存目录 --------------------
+    save_dir = "./calibration_data"
+    os.makedirs(save_dir, exist_ok=True)
     
     # 检测角点（带几何筛选）
     P_w_list, P_img_list = load_and_detect_calibration_images(
@@ -1220,7 +1036,7 @@ if __name__ == "__main__":
         max_line_error_px=MAX_LINE_ERROR_PX, max_reject_ratio=MAX_REJECT_RATIO,
         debug=DEBUG_CORNERS
     )
-    
+        
     # ===== 自动识别图片类型，获取第一张图片的尺寸 =====
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff')
     sample_path = None
@@ -1244,6 +1060,13 @@ if __name__ == "__main__":
     img_h, img_w = sample_img.shape[:2]
     # print(f"使用图片 {os.path.basename(sample_path)} 获取图像尺寸: {img_w} x {img_h}")
     
+    if P_img_list:
+        coverage_ok, stats = analyze_overall_coverage(P_img_list, (img_h, img_w), grid=(4,4))
+        # plot_coverage_heatmap(stats, (img_h, img_w), save_path=os.path.join(save_dir, "coverage_heatmap.png"))
+        plot_all_corners_scatter(P_img_list, (img_h, img_w), save_path=os.path.join(save_dir, "corners_scatter.png"))
+        if not coverage_ok:
+            print("覆盖不均匀警告...")
+                # exit(1)
     # 标定
     cam_params = calibrate_scheimpflug(
         P_w_list, P_img_list, (img_h, img_w),
@@ -1253,19 +1076,76 @@ if __name__ == "__main__":
         lens_type=LENS_TYPE
     )
     
-    # 调用验证函数
+
     result = validate_scheimpflug_calibration(
-        "test.jpg",  # 请替换为实际的测试图片路径
+        test_images,
         cam_params,
-        (11, 8),
-        5.0,
+        PATTERN_SIZE,
+        SQUARE_SIZE_MM,
         show=True
-        )
-    # 可选：保存更详细的误差图
-    if result['is_good']:
-        print("✅ 标定通过，可用于实际测量")
-    else:
-        print("❌ 标定不通过，建议增加更多标定图片或调整畸变模型")
+    )
+
+    # 访问每张图像统计
+    # for img_stat in result['per_image']:
+    #     print(img_stat['path'], img_stat['dx_mean'], img_stat['dy_mean'])
+
+    # 访问整体统计
+    overall = result['overall']
+        
+    # -------------------- 保存结果（JSON格式） --------------------
+    # 生成时间戳
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = os.path.join(save_dir, f"calibration_{timestamp}.json")
+
+    # 准备要保存的数据（将numpy类型转换为Python原生类型）
+    def serialize(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, tuple):
+            return list(obj)
+        if isinstance(obj, np.float32) or isinstance(obj, np.float64):
+            return float(obj)
+        if isinstance(obj, np.int32) or isinstance(obj, np.int64):
+            return int(obj)
+        return obj
+
+    # 拷贝参数字典并转换
+    saved_params = {}
+    for key, value in cam_params.items():
+        # raw_x 可能非常大，建议不保存（或者保存为列表）
+        if key == 'raw_x':
+            # 可以选择保存为列表，但会占用大量空间
+            # saved_params[key] = value.tolist()
+            continue   # 跳过 raw_x，减小文件体积
+        if key in ('tau', 'rho'):
+            # 将弧度转换为度数后保存
+            saved_params[key] = float(np.degrees(value))
+        else:
+            saved_params[key] = serialize(value)
+
+    # 加入附加信息
+    saved_params['timestamp'] = timestamp
+    saved_params['config'] = {
+        'pattern_size': PATTERN_SIZE,
+        'square_size_mm': SQUARE_SIZE_MM,
+        'pixel_size_x_mm': PIXEL_SIZE_X_MM,
+        'pixel_size_y_mm': PIXEL_SIZE_Y_MM,
+        'distortion_model': DISTORTION_MODEL,
+        'lens_type': LENS_TYPE,
+        'max_line_error_px': MAX_LINE_ERROR_PX,
+        'max_reject_ratio': MAX_REJECT_RATIO,
+        'image_dir': IMAGE_DIR,
+        'test_image': TEST_IMAGE_PATH
+    }
+    if result is not None:
+        saved_params['validation'] = serialize(result)
+
+    # 写入JSON文件
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(saved_params, f, indent=4, ensure_ascii=False)
+
+    print(f"\n标定结果已保存至: {save_path}")    
+    
     # 校正一张示例图像
     test_img = cv2.imread(sample_path)
     if test_img is not None:
@@ -1278,3 +1158,4 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("高精度标定提醒：...")
     print("="*60)
+    
