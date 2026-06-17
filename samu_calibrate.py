@@ -296,6 +296,9 @@ def load_and_detect_calibration_images(
     P_w_list = []
     P_img_list = []
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    
+    show_flag = show_corners   # 初始为传入参数
+    
     for idx, path in enumerate(image_paths):
         img = cv2.imread(path)
         if img is None:
@@ -339,8 +342,8 @@ def load_and_detect_calibration_images(
         if ret and corners_subpix is not None:
             P_w_list.append(objp.copy())
             P_img_list.append(corners_subpix)
-            # print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
-            if show_corners:
+            print(f"{os.path.basename(path)}: 检测到 {len(corners_subpix)} 个特征点")
+            if show_flag:
                 cols, rows = pattern_size
                 img_draw = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
                 colors = [
@@ -376,7 +379,11 @@ def load_and_detect_calibration_images(
                         col_pts.append(tuple(pts[idx].astype(int)))
                     cv2.polylines(img_draw, [np.array(col_pts)], False, (180, 180, 180), 1)
                 cv2.imshow('calibrate', img_draw)
-                cv2.waitKey(0)
+                key = cv2.waitKey(0) & 0xFF   # 获取按键
+                if key == 27:                 # ESC 键
+                    show_flag = False
+                    cv2.destroyAllWindows()
+                    print("按下 ESC，后续图片将不再显示（但仍会继续检测角点）")
     cv2.destroyAllWindows()
     if len(P_w_list) < 3:
         raise ValueError(f"有效图片仅 {len(P_w_list)} 张，至少需要 3 张。")
@@ -427,7 +434,7 @@ def estimate_initial_extrinsics_scheimpflug(P_w_list, P_img_list, cam_params):
 
         x0 = np.hstack([rvec.ravel(), tvec.ravel()])
         # 使用 Levenberg-Marquardt 进行快速优化
-        res = least_squares(residual, x0, method='lm', max_nfev=200)
+        res = least_squares(residual, x0, method='lm', max_nfev=500)
         opt_rvec = res.x[:3]
         opt_tvec = res.x[3:6]
         extrinsics.append((opt_rvec, opt_tvec))
@@ -443,27 +450,23 @@ def calibration_residuals(params, P_w_list, P_img_list, sx, sy,
     num_views = len(P_w_list)
     if distortion_model == 'none':
         c, d, tau, rho, cx, cy = params[0:6]
-        k1=k2=k3=p1=p2=alpha1=alpha2=0.0
+        k1=k2=k3=p1=p2=0.0
         int_len = 6
     elif distortion_model == 'k1':
         c, d, tau, rho, cx, cy, k1 = params[0:7]
-        k2=k3=p1=p2=alpha1=alpha2=0.0
+        k2=k3=p1=p2=0.0
         int_len = 7
     elif distortion_model == 'k2':
         c, d, tau, rho, cx, cy, k1, k2 = params[0:8]
-        k3=p1=p2=alpha1=alpha2=0.0
+        k3=p1=p2=0.0
         int_len = 8
     elif distortion_model == 'full':
         c, d, tau, rho, cx, cy, k1, k2, p1, p2 = params[0:10]
-        k3=alpha1=alpha2=0.0
+        k3=0.0
         int_len = 10
     elif distortion_model == 'full_k3':
         c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2 = params[0:11]
-        alpha1=alpha2=0.0
         int_len = 11
-    elif distortion_model == 'full_tilt':
-        c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2, alpha1, alpha2 = params[0:13]
-        int_len = 13
     else:
         raise ValueError(f"未知的畸变模型: {distortion_model}")
     
@@ -498,31 +501,24 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
     
     if distortion_model == 'none':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0]
-        lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 0, 0]
-        upper_bounds = [15.0, 15.0, np.radians(30), np.pi, w-1, h-1]
+        lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 600, 450]
+        upper_bounds = [15.0, 15.0, np.radians(30), np.pi, 680, 530]
     elif distortion_model == 'k1':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0]
-        lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 0, 0, -1.0]
-        upper_bounds = [15.0, 15.0, np.radians(30), np.pi, w-1, h-1, 1.0]
+        lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 600, 450, -1.0]
+        upper_bounds = [15.0, 15.0, np.radians(30), np.pi, 680, 530,  1.0]
     elif distortion_model == 'k2':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0]
-        lower_bounds = [5.0, 7.5, -np.radians(30), -np.pi, 0, 0, -1.0, -1.0]
-        upper_bounds = [15.0, 9.5, np.radians(30),  np.pi, w-1, h-1, 1.0, 1.0]
+        lower_bounds = [5.0, 7.5, -np.radians(30), -np.pi, 600, 450, -1.0, -1.0]
+        upper_bounds = [15.0, 9.5, np.radians(30),  np.pi, 680, 530, 1.0, 1.0]
     elif distortion_model == 'full':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0]
-        lower_bounds = [ 5.0,  5.0, -np.radians(30), -np.pi, 0,   492, -1.0, -1.0, -0.5, -0.5]
-        upper_bounds = [15.0, 25.0,  np.radians(30),  np.pi, w-1, 532, 1.0, 1.0, 0.5, 0.5]
+        lower_bounds = [ 5.0,  5.0, -np.radians(30), -np.pi, 600, 450, -1.0, -1.0, -0.5, -0.5]
+        upper_bounds = [15.0, 25.0,  np.radians(30),  np.pi, 680, 530, 1.0, 1.0, 0.5, 0.5]
     elif distortion_model == 'full_k3':
         init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        lower_bounds = [5.0,   5.0,  np.radians(9.3)-1e-8, -np.pi, 0,   492, -1.0, -1.0, -1.0, -0.5, -0.5]
-        upper_bounds = [15.0, 50.0,  np.radians(9.3)+1e-8,  np.pi, w-1, h-1,  1.0,  1.0,  1.0,  0.5,  0.5]
-    else:  # 'full_tilt'
-        init_int_vals = [c0, d0, tau0, rho0, cx0, cy0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        lower_bounds = [5.0, 5.0, -np.radians(30), -np.pi, 0, 0,
-                        -1.0, -1.0, -1.0, -0.5, -0.5, -2.0, -2.0]
-        upper_bounds = [15.0, 15.0, np.radians(30), np.pi, w-1, h-1,
-                        1.0, 1.0, 1.0, 0.5, 0.5, 5.0, 5.0]
-
+        lower_bounds = [5.0,   5.0, -np.radians(15), -np.pi, 600, 450, -1.0, -1.0, -1.0, -0.5, -0.5]
+        upper_bounds = [15.0, 15.0,  np.radians(15),  np.pi, 680, h-1,  1.0,  1.0,  1.0,  0.5,  0.5]
 
     # 构建一个临时参数字典（用于初值估计）
     tmp_params = {
@@ -590,9 +586,6 @@ def calibrate_scheimpflug(P_w_list, P_img_list, image_shape: Tuple[int, int],
         c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2 = result.x[0:11]
         alpha1 = alpha2 = 0.0
         int_len = 11
-    else:
-        c, d, tau, rho, cx, cy, k1, k2, k3, p1, p2, alpha1, alpha2 = result.x[0:13]
-        int_len = 13
     
     total_err_sq = 0.0
     total_pts = 0
@@ -1030,7 +1023,7 @@ if __name__ == "__main__":
     LENS_TYPE = 'perspective'
     SHOW_CORNERS = True
     # 放宽筛选参数 
-    MAX_LINE_ERROR_PX = 1.0
+    MAX_LINE_ERROR_PX = 0.5
     MAX_REJECT_RATIO = 0.6
     DEBUG_CORNERS = True
     
